@@ -1,0 +1,5 @@
+.DS_Store
+*.tflite
+*.log
+*.joblib
+workspace/export_influx_to_csv.py

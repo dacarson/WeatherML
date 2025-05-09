@@ -1,0 +1,39 @@
+FROM arm64v8/ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system packages
+RUN apt-get update && apt-get install -y \
+    python3.10 python3-pip python3-dev python-is-python3 \
+    build-essential curl unzip git wget sudo \
+    libstdc++6 libc++1 libc++abi1 \
+    && apt-get clean
+
+# Upgrade pip and install Python packages
+RUN pip install --upgrade pip
+RUN pip install \
+    numpy \
+    tensorflow==2.12.0 \
+    tflite-support \
+    tensorflow-datasets \
+    tensorflow-metadata \
+    pillow \
+    influxdb \
+    pandas \
+    joblib \
+    scikit-learn \
+    shap
+
+# Install Edge TPU compiler (diploria3) with correct layout
+RUN curl -L -o diploria3.tar.gz https://github.com/google-coral/edgetpu/archive/refs/tags/diploria3.tar.gz && \
+    tar -xzf diploria3.tar.gz && \
+    mkdir -p /usr/local/bin/edgetpu_compiler_bin && \
+    cp -r edgetpu-diploria3/compiler/aarch64/edgetpu_compiler_bin /usr/local/bin/ && \
+    cp edgetpu-diploria3/compiler/aarch64/edgetpu_compiler /usr/local/bin/edgetpu_compiler && \
+    chmod +x /usr/local/bin/edgetpu_compiler && \
+    rm -rf diploria3.tar.gz edgetpu-diploria3
+
+# Default working directory
+WORKDIR /workspace
+
+CMD ["bash"]
