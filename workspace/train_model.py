@@ -14,10 +14,18 @@ train_df['humidity_lag1'] = train_df['relative_humidity'].shift(1)
 val_df['temp_lag1'] = val_df['temperature'].shift(1)
 val_df['humidity_lag1'] = val_df['relative_humidity'].shift(1)
 
-# Compute rate-of-change features
+# Compute rate-of-change features using rolling linear slope
+from scipy.stats import linregress
+
+def rolling_slope(series, window=15):
+    return series.rolling(window=window, center=True).apply(
+        lambda x: linregress(range(len(x)), x).slope if not np.isnan(x).any() else np.nan,
+        raw=True
+    )
+
 for col in ['temperature', 'relative_humidity', 'station_pressure', 'solar_radiation', 'illuminance']:
-    train_df[f'{col}_delta'] = train_df[col].diff()
-    val_df[f'{col}_delta'] = val_df[col].diff()
+    train_df[f'{col}_delta'] = rolling_slope(train_df[col])
+    val_df[f'{col}_delta'] = rolling_slope(val_df[col])
 
 # Drop rows with NaNs introduced by diff()
 train_df.dropna(inplace=True)
