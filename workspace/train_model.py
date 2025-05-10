@@ -26,11 +26,9 @@ val_df.dropna(inplace=True)
 # Define feature and target columns
 features = [
     'illuminance', 'solar_radiation', 'uv', 'relative_humidity',
-    'station_pressure', 'wind_avg', 'wind_direction',
-    'wind_gust', 'wind_lull', 'rain_accumulated', 'precipitation_type',
-    'day_of_year', 'time_of_day',
-    'temperature_delta', 'relative_humidity_delta',
-    'station_pressure_delta', 'solar_radiation_delta', 'illuminance_delta',
+    'station_pressure', 'wind_avg',
+    'wind_gust', 'day_of_year', 'time_of_day',
+    'temperature_delta', 'solar_radiation_delta', 'illuminance_delta',
     'temp_lag1', 'humidity_lag1'
 ]
 
