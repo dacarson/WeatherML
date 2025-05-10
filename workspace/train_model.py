@@ -51,11 +51,18 @@ y_val = val_df[targets].values
 input_layer = tf.keras.layers.Input(shape=(len(features),))
 wide = tf.keras.layers.Dense(16)(input_layer)
 deep = tf.keras.layers.Dense(128, activation='relu')(input_layer)
+deep = tf.keras.layers.BatchNormalization()(deep)
 deep = tf.keras.layers.Dropout(0.3)(deep)
-deep = tf.keras.layers.Dense(64, activation='relu')(deep)
-deep = tf.keras.layers.Dropout(0.3)(deep)
-deep = tf.keras.layers.Dense(32, activation='relu')(deep)
-merged = tf.keras.layers.Concatenate()([wide, deep])
+
+res = tf.keras.layers.Dense(64, activation='relu')(deep)
+res = tf.keras.layers.BatchNormalization()(res)
+shortcut = tf.keras.layers.Dense(64)(deep)
+res = tf.keras.layers.Add()([shortcut, res])  # residual connection with projection
+
+res = tf.keras.layers.Dense(32, activation='relu')(res)
+res = tf.keras.layers.BatchNormalization()(res)
+
+merged = tf.keras.layers.Concatenate()([wide, res])
 output_layer = tf.keras.layers.Dense(3)(merged)
 model = tf.keras.Model(inputs=input_layer, outputs=output_layer)
 
