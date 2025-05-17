@@ -137,11 +137,11 @@ def build_and_train_model(name):
 
     metrics = {
         "name": name,
-        "val_loss": val_loss,
-        "val_mae": val_mae,
-        "best_epoch": best_epoch,
-        "feature_importance": sorted_importance,
-        "model_size_kb": tflite_model_size_kb
+        "val_loss": float(val_loss),
+        "val_mae": float(val_mae),
+        "best_epoch": int(best_epoch),
+        "feature_importance": [(f, float(i)) for f, i in sorted_importance],
+        "model_size_kb": float(tflite_model_size_kb)
     }
 
     with open(f"results_{name}.json", "w") as f:

@@ -1,3 +1,5 @@
+import os
+import json
 import tensorflow as tf
 from tensorflow.keras.callbacks import EarlyStopping
 import numpy as np
@@ -141,6 +143,14 @@ def build_and_train_model(name):
     val_rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     print(f"Validation RMSE (denormalized): {val_rmse:.4f}")
 
+    # Track val_loss, val_mae, and best_epoch on normalized validation data
+    val_loss, val_mae = model.evaluate(val_dataset, verbose=0)
+    best_epoch = np.argmin(history.history['val_loss']) + 1
+    print(f"\nFinal Metrics [{name}]:")
+    print(f"  val_loss (normalized): {val_loss:.4f}")
+    print(f"  val_mae (normalized): {val_mae:.4f}")
+    print(f"  Best epoch: {best_epoch}")
+
     feature_importance = {}
     print("Calculating permutation feature importance...")
 
@@ -186,6 +196,9 @@ def build_and_train_model(name):
     with open(tflite_fname, "wb") as f:
         f.write(quantized_tflite_model)
 
+    tflite_model_size_kb = os.path.getsize(tflite_fname) / 1024
+    print(f"  Quantized model size: {tflite_model_size_kb:.2f} KB")
+
     print(f"Compiling TFLite model with EdgeTPU compiler: {tflite_fname}")
     result = subprocess.run(
         ["edgetpu_compiler", tflite_fname],
@@ -195,6 +208,21 @@ def build_and_train_model(name):
     )
     print(result.stdout)
     print(result.stderr)
+
+    # Save results as JSON
+    metrics = {
+        "name": name,
+        "val_loss": float(val_loss),
+        "val_mae": float(val_mae),
+        "best_epoch": int(best_epoch),
+        "average_mae_denormalized": float(np.mean(mae_per_target)),
+        "val_rmse_denormalized": float(val_rmse),
+        "feature_importance": [(f, float(i)) for f, i in sorted_importance],
+        "model_size_kb": float(tflite_model_size_kb)
+    }
+
+    with open(f"results_{name}.json", "w") as f:
+        json.dump(metrics, f, indent=2)
 
 
 # Run default architecture
