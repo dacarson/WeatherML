@@ -1,0 +1,28 @@
+# Use a basic Debian image for x86_64
+FROM --platform=linux/amd64 debian:bullseye
+
+# Install dependencies
+RUN apt-get update && \
+    apt-get install -y \
+    git \
+    curl \
+    build-essential \
+    cmake \
+    python3 \
+    python3-pip \
+    unzip \
+    wget \
+    && apt-get clean
+
+# Clone only the x86_64 compiler folder
+WORKDIR /opt
+RUN git clone --depth=1 https://github.com/google-coral/edgetpu.git \
+    && mv edgetpu/compiler/x86_64 /opt/edgetpu_compiler \
+    && rm -rf edgetpu
+
+# Create a mountable workspace directory
+RUN mkdir -p /workspace
+WORKDIR /workspace
+
+# Default shell
+CMD ["/bin/bash"]
