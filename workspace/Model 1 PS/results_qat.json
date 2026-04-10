@@ -1,0 +1,43 @@
+{
+  "model_type": "Improved Quantization",
+  "features": [
+    "illuminance",
+    "solar_radiation",
+    "uv",
+    "relative_humidity",
+    "station_pressure",
+    "wind_avg",
+    "wind_gust",
+    "day_of_year",
+    "time_of_day",
+    "temperature_delta",
+    "temp_lag1",
+    "humidity_lag1"
+  ],
+  "targets": [
+    "temp_t+1hr",
+    "temp_t+2hr",
+    "temp_t+3hr"
+  ],
+  "float_mae_scores": [
+    0.021675496277420797,
+    0.030829522384217004,
+    0.038645761304747304
+  ],
+  "qat_mae_scores": [
+    0.021675496277420797,
+    0.030829522384217004,
+    0.038645761304747304
+  ],
+  "quantization_results": {
+    "standard_int8": true,
+    "float16": true,
+    "dynamic": true,
+    "improved_int8": true
+  },
+  "training_samples": 480080,
+  "validation_samples": 440278,
+  "float_epochs_trained": 26,
+  "best_float_val_loss": 0.006455176509916782,
+  "timestamp": "2025-09-18T14:26:57.704915"
+}

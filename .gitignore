@@ -2,4 +2,14 @@
 *.tflite
 *.log
 *.joblib
+*.h5
+*.tar
+__pycache__/
+workspace/*/checkpoints/
+
+# Large training/validation data files (regenerate with export_influx_to_csv*.py)
+workspace/*.csv
+!workspace/fold_metrics.csv
+
+# Per-location data subdirectories
 workspace/export_influx_to_csv.py

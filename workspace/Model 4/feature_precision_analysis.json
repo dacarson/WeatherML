@@ -1,0 +1,182 @@
+{
+  "raw_analysis": {
+    "illuminance": {
+      "min": 0.0,
+      "max": 151615.0,
+      "range": 151615.0,
+      "optimal_precision": "INT32",
+      "reasoning": "Range > 65535 (151615.00)"
+    },
+    "solar_radiation": {
+      "min": 0.0,
+      "max": 1264.0,
+      "range": 1264.0,
+      "optimal_precision": "INT16",
+      "reasoning": "Range \u2264 65535 (1264.00)"
+    },
+    "uv": {
+      "min": 0.0,
+      "max": 12.72,
+      "range": 12.72,
+      "optimal_precision": "INT8",
+      "reasoning": "Range \u2264 255 (12.72)"
+    },
+    "relative_humidity": {
+      "min": 19.51,
+      "max": 100.0,
+      "range": 80.49,
+      "optimal_precision": "INT8",
+      "reasoning": "Range \u2264 255 (80.49)"
+    },
+    "station_pressure": {
+      "min": 982.14,
+      "max": 1025.2,
+      "range": 43.06000000000006,
+      "optimal_precision": "INT8",
+      "reasoning": "Range \u2264 255 (43.06)"
+    },
+    "wind_avg": {
+      "min": 0.0,
+      "max": 5.43,
+      "range": 5.43,
+      "optimal_precision": "INT8",
+      "reasoning": "Range \u2264 255 (5.43)"
+    },
+    "wind_gust": {
+      "min": 0.0,
+      "max": 10.58,
+      "range": 10.58,
+      "optimal_precision": "INT8",
+      "reasoning": "Range \u2264 255 (10.58)"
+    },
+    "day_of_year": {
+      "min": 1.0,
+      "max": 365.0,
+      "range": 364.0,
+      "optimal_precision": "INT16",
+      "reasoning": "Range \u2264 65535 (364.00)"
+    },
+    "time_of_day": {
+      "min": 0.0,
+      "max": 23.983333333333334,
+      "range": 23.983333333333334,
+      "optimal_precision": "INT8",
+      "reasoning": "Range \u2264 255 (23.98)"
+    },
+    "temperature_delta": {
+      "min": -0.9469642857142858,
+      "max": 1.0938571428571426,
+      "range": 2.0408214285714283,
+      "optimal_precision": "INT8",
+      "reasoning": "Range \u2264 255 (2.04)"
+    },
+    "temp_lag1": {
+      "min": -4.64,
+      "max": 34.35,
+      "range": 38.99,
+      "optimal_precision": "INT8",
+      "reasoning": "Range \u2264 255 (38.99)"
+    },
+    "humidity_lag1": {
+      "min": 19.51,
+      "max": 100.0,
+      "range": 80.49,
+      "optimal_precision": "INT8",
+      "reasoning": "Range \u2264 255 (80.49)"
+    }
+  },
+  "normalized_analysis": {
+    "illuminance": {
+      "unique_values": 85976,
+      "effective_bits": 32,
+      "actual_bits_needed": 17,
+      "recommendation": "INT32 needed"
+    },
+    "solar_radiation": {
+      "unique_values": 1158,
+      "effective_bits": 16,
+      "actual_bits_needed": 11,
+      "recommendation": "INT16 sufficient"
+    },
+    "uv": {
+      "unique_values": 1169,
+      "effective_bits": 16,
+      "actual_bits_needed": 11,
+      "recommendation": "INT16 sufficient"
+    },
+    "relative_humidity": {
+      "unique_values": 7775,
+      "effective_bits": 16,
+      "actual_bits_needed": 13,
+      "recommendation": "INT16 sufficient"
+    },
+    "station_pressure": {
+      "unique_values": 3906,
+      "effective_bits": 16,
+      "actual_bits_needed": 12,
+      "recommendation": "INT16 sufficient"
+    },
+    "wind_avg": {
+      "unique_values": 486,
+      "effective_bits": 16,
+      "actual_bits_needed": 9,
+      "recommendation": "INT16 sufficient"
+    },
+    "wind_gust": {
+      "unique_values": 821,
+      "effective_bits": 16,
+      "actual_bits_needed": 10,
+      "recommendation": "INT16 sufficient"
+    },
+    "day_of_year": {
+      "unique_values": 354,
+      "effective_bits": 16,
+      "actual_bits_needed": 9,
+      "recommendation": "INT16 sufficient"
+    },
+    "time_of_day": {
+      "unique_values": 1440,
+      "effective_bits": 16,
+      "actual_bits_needed": 11,
+      "recommendation": "INT16 sufficient"
+    },
+    "temperature_delta": {
+      "unique_values": 12587,
+      "effective_bits": 16,
+      "actual_bits_needed": 14,
+      "recommendation": "INT16 sufficient"
+    },
+    "temp_lag1": {
+      "unique_values": 2787,
+      "effective_bits": 16,
+      "actual_bits_needed": 12,
+      "recommendation": "INT16 sufficient"
+    },
+    "humidity_lag1": {
+      "unique_values": 7775,
+      "effective_bits": 16,
+      "actual_bits_needed": 13,
+      "recommendation": "INT16 sufficient"
+    }
+  },
+  "hybrid_recommendation": {
+    "int8_features": [],
+    "int16_features": [
+      "solar_radiation",
+      "uv",
+      "relative_humidity",
+      "station_pressure",
+      "wind_avg",
+      "wind_gust",
+      "day_of_year",
+      "time_of_day",
+      "temperature_delta",
+      "temp_lag1",
+      "humidity_lag1"
+    ],
+    "int32_features": [
+      "illuminance"
+    ],
+    "total_features": 26
+  }
+}

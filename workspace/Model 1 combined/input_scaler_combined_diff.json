@@ -1,0 +1,158 @@
+{
+  "uv": {
+    "min": 0,
+    "max": 16.820999999999998
+  },
+  "wind_avg": {
+    "min": 0,
+    "max": 15.4665
+  },
+  "wind_gust": {
+    "min": 0,
+    "max": 22.008000000000003
+  },
+  "temperature_delta": {
+    "min": -1.0966196428571429,
+    "max": 2.195798214285714
+  },
+  "pressure_delta": {
+    "min": -2.1912589285714352,
+    "max": 2.5672232142857134
+  },
+  "humidity_delta": {
+    "min": -4.065342857142857,
+    "max": 2.669485714285714
+  },
+  "day_of_year_sin": {
+    "min": -1,
+    "max": 1
+  },
+  "day_of_year_cos": {
+    "min": -1,
+    "max": 1
+  },
+  "time_of_day_sin": {
+    "min": -1,
+    "max": 1
+  },
+  "time_of_day_cos": {
+    "min": -1,
+    "max": 1
+  },
+  "time_of_day_sin2": {
+    "min": -1,
+    "max": 1
+  },
+  "time_of_day_cos2": {
+    "min": -1,
+    "max": 1
+  },
+  "temp_lag30": {
+    "min": -10,
+    "max": 55
+  },
+  "humidity_lag30": {
+    "min": 0,
+    "max": 100
+  },
+  "temp_lag60": {
+    "min": -10,
+    "max": 55
+  },
+  "humidity_lag60": {
+    "min": 0,
+    "max": 100
+  },
+  "temp_lag120": {
+    "min": -10,
+    "max": 55
+  },
+  "humidity_lag120": {
+    "min": 0,
+    "max": 100
+  },
+  "wind_avg_lag30": {
+    "min": 0,
+    "max": 15.4665
+  },
+  "wind_gust_lag30": {
+    "min": 0,
+    "max": 22.008000000000003
+  },
+  "uv_lag30": {
+    "min": 0,
+    "max": 16.820999999999998
+  },
+  "pressure_lag30": {
+    "min": 979.987,
+    "max": 1027.353
+  },
+  "is_coastal": {
+    "min": 0,
+    "max": 1
+  },
+  "coastal_temp": {
+    "min": -6.5895,
+    "max": 36.2995
+  },
+  "desert_temp": {
+    "min": -2.503,
+    "max": 52.563
+  },
+  "coastal_humidity": {
+    "min": -5.0,
+    "max": 105.0
+  },
+  "desert_humidity": {
+    "min": -5.0,
+    "max": 105.0
+  },
+  "coastal_wind": {
+    "min": -0.2715,
+    "max": 5.701499999999999
+  },
+  "desert_wind": {
+    "min": -0.7365,
+    "max": 15.4665
+  },
+  "daily_temp_range": {
+    "min": -16.543999999999997,
+    "max": 22.703999999999994
+  },
+  "coastal_temp_range": {
+    "min": -16.241999999999997,
+    "max": 16.362
+  },
+  "desert_temp_range": {
+    "min": -15.326,
+    "max": 22.645999999999994
+  },
+  "humidity_stability": {
+    "min": 0,
+    "max": 45.769499999999994
+  },
+  "coastal_humidity_stability": {
+    "min": -2.0244999999999997,
+    "max": 42.5145
+  },
+  "desert_humidity_stability": {
+    "min": -2.1795,
+    "max": 45.769499999999994
+  },
+  "time_sin_uv": {
+    "min": -14.779708499970054,
+    "max": 1.8190743853114593
+  },
+  "time_cos_uv": {
+    "min": -4.725658030347288,
+    "max": 13.30976227681005
+  },
+  "time_sin_temp_lag": {
+    "min": -49.06625362884452,
+    "max": 46.13104059712853
+  },
+  "time_cos_temp_lag": {
+    "min": -39.79674589403576,
+    "max": 54.000571429142454
+  }
+}

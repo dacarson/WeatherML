@@ -1,0 +1,110 @@
+{
+  "uv": {
+    "min": 0,
+    "max": 13.356000000000002
+  },
+  "wind_avg": {
+    "min": 0,
+    "max": 5.701499999999999
+  },
+  "wind_gust": {
+    "min": 0,
+    "max": 11.109
+  },
+  "solar_radiation": {
+    "min": 0,
+    "max": 1327.2
+  },
+  "illuminance": {
+    "min": 0,
+    "max": 159195.75
+  },
+  "relative_humidity": {
+    "min": 0,
+    "max": 100
+  },
+  "station_pressure": {
+    "min": 979.987,
+    "max": 1027.353
+  },
+  "day_of_year_sin": {
+    "min": -1,
+    "max": 1
+  },
+  "day_of_year_cos": {
+    "min": -1,
+    "max": 1
+  },
+  "time_of_day_sin": {
+    "min": -1,
+    "max": 1
+  },
+  "time_of_day_cos": {
+    "min": -1,
+    "max": 1
+  },
+  "time_of_day_sin2": {
+    "min": -1,
+    "max": 1
+  },
+  "time_of_day_cos2": {
+    "min": -1,
+    "max": 1
+  },
+  "temp_lag30": {
+    "min": -10,
+    "max": 55
+  },
+  "humidity_lag30": {
+    "min": 0,
+    "max": 100
+  },
+  "temp_lag60": {
+    "min": -10,
+    "max": 55
+  },
+  "humidity_lag60": {
+    "min": 0,
+    "max": 100
+  },
+  "temp_lag120": {
+    "min": -10,
+    "max": 55
+  },
+  "humidity_lag120": {
+    "min": 0,
+    "max": 100
+  },
+  "wind_avg_lag30": {
+    "min": 0,
+    "max": 5.701499999999999
+  },
+  "wind_gust_lag30": {
+    "min": 0,
+    "max": 11.109
+  },
+  "uv_lag30": {
+    "min": 0,
+    "max": 13.356000000000002
+  },
+  "pressure_lag30": {
+    "min": 979.987,
+    "max": 1027.353
+  },
+  "wind_direction_sin": {
+    "min": -1,
+    "max": 1
+  },
+  "wind_direction_cos": {
+    "min": -1,
+    "max": 1
+  },
+  "wind_lull": {
+    "min": 0,
+    "max": 3.528
+  },
+  "rain_accumulated": {
+    "min": 0,
+    "max": 6.602754900000001
+  }
+}

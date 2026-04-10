@@ -1,0 +1,42 @@
+{
+  "name": "conv1d_tpu_run2",
+  "val_loss": 0.022749843075871468,
+  "val_mae": 0.03396877615402142,
+  "best_epoch": 1,
+  "average_mae_denormalized": 3.0175600051879883,
+  "val_rmse_denormalized": 4.353220543288697,
+  "feature_importance": [
+    [
+      "temp_avg_15min",
+      -0.006383407860994339
+    ],
+    [
+      "temperature_delta",
+      -0.006383407860994339
+    ],
+    [
+      "sin_time_of_day",
+      -0.006383407860994339
+    ],
+    [
+      "cos_time_of_day",
+      -0.006383407860994339
+    ],
+    [
+      "illuminance",
+      -0.006383407860994339
+    ],
+    [
+      "solar_radiation",
+      -0.006383407860994339
+    ],
+    [
+      "station_pressure",
+      -0.006383407860994339
+    ],
+    [
+      "relative_humidity",
+      -0.006383407860994339
+    ]
+  ]
+}

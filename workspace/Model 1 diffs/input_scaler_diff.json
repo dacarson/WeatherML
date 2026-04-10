@@ -1,0 +1,146 @@
+{
+  "illuminance_delta": {
+    "min": -11018.113392857143,
+    "max": 12123.43125
+  },
+  "solar_radiation_delta": {
+    "min": -91.84125,
+    "max": 101.01624999999999
+  },
+  "uv": {
+    "min": 0,
+    "max": 13.356000000000002
+  },
+  "wind_avg": {
+    "min": 0,
+    "max": 5.701499999999999
+  },
+  "wind_gust": {
+    "min": 0,
+    "max": 11.109
+  },
+  "day_of_year_sin": {
+    "min": -1,
+    "max": 1
+  },
+  "day_of_year_cos": {
+    "min": -1,
+    "max": 1
+  },
+  "time_of_day_sin": {
+    "min": -1,
+    "max": 1
+  },
+  "time_of_day_cos": {
+    "min": -1,
+    "max": 1
+  },
+  "time_of_day_sin2": {
+    "min": -1,
+    "max": 1
+  },
+  "time_of_day_cos2": {
+    "min": -1,
+    "max": 1
+  },
+  "time_sin_solar": {
+    "min": -98.35489664849112,
+    "max": 78.48004321085118
+  },
+  "time_cos_solar": {
+    "min": -81.02476347359844,
+    "max": 65.75747625836925
+  },
+  "time_sin_uv": {
+    "min": -12.360356549743994,
+    "max": 1.248748095863661
+  },
+  "time_cos_uv": {
+    "min": -3.7909711942139785,
+    "max": 9.90704337976992
+  },
+  "time_sin_wind": {
+    "min": -5.669288908511298,
+    "max": 5.109920065188893
+  },
+  "time_cos_wind": {
+    "min": -5.168186129849607,
+    "max": 5.917139562743289
+  },
+  "time_sin_temp_lag": {
+    "min": -30.14588841974947,
+    "max": 27.1243965577755
+  },
+  "time_cos_temp_lag": {
+    "min": -21.390070082337598,
+    "max": 34.08449781843791
+  },
+  "season_sin_temp_lag": {
+    "min": -37.271367188617695,
+    "max": 29.86258747592109
+  },
+  "season_cos_temp_lag": {
+    "min": -30.694032367756442,
+    "max": 21.35070226836491
+  },
+  "season_sin_humidity": {
+    "min": -107.7781501364851,
+    "max": 107.01716649468302
+  },
+  "season_cos_humidity": {
+    "min": -106.32223566135289,
+    "max": 108.83706266893526
+  },
+  "temperature_delta": {
+    "min": -1.0490053571428573,
+    "max": 1.1958982142857142
+  },
+  "pressure_delta": {
+    "min": -1.2698464285714266,
+    "max": 2.5233464285714273
+  },
+  "humidity_delta": {
+    "min": -4.0043178571428575,
+    "max": 2.6576750000000002
+  },
+  "temp_lag30": {
+    "min": -10,
+    "max": 55
+  },
+  "humidity_lag30": {
+    "min": 0,
+    "max": 100
+  },
+  "temp_lag60": {
+    "min": -10,
+    "max": 55
+  },
+  "humidity_lag60": {
+    "min": 0,
+    "max": 100
+  },
+  "temp_lag120": {
+    "min": -10,
+    "max": 55
+  },
+  "humidity_lag120": {
+    "min": 0,
+    "max": 100
+  },
+  "wind_avg_lag30": {
+    "min": 0,
+    "max": 5.701499999999999
+  },
+  "wind_gust_lag30": {
+    "min": 0,
+    "max": 11.109
+  },
+  "uv_lag30": {
+    "min": 0,
+    "max": 13.356000000000002
+  },
+  "pressure_lag30": {
+    "min": 979.987,
+    "max": 1027.353
+  }
+}

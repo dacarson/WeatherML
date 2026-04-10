@@ -1,0 +1,74 @@
+{
+  "temperature": {
+    "min": -10,
+    "max": 55
+  },
+  "uv": {
+    "min": 0,
+    "max": 13.356000000000002
+  },
+  "wind_avg": {
+    "min": 0,
+    "max": 30
+  },
+  "wind_gust": {
+    "min": 0,
+    "max": 40
+  },
+  "solar_radiation": {
+    "min": 0,
+    "max": 1434.3
+  },
+  "illuminance": {
+    "min": 0,
+    "max": 172156.95
+  },
+  "relative_humidity": {
+    "min": 0,
+    "max": 100
+  },
+  "station_pressure": {
+    "min": 979.987,
+    "max": 1027.353
+  },
+  "day_of_year_sin": {
+    "min": -1,
+    "max": 1
+  },
+  "day_of_year_cos": {
+    "min": -1,
+    "max": 1
+  },
+  "time_of_day_sin": {
+    "min": -1,
+    "max": 1
+  },
+  "time_of_day_cos": {
+    "min": -1,
+    "max": 1
+  },
+  "time_of_day_sin2": {
+    "min": -1,
+    "max": 1
+  },
+  "time_of_day_cos2": {
+    "min": -1,
+    "max": 1
+  },
+  "wind_direction_sin": {
+    "min": -1,
+    "max": 1
+  },
+  "wind_direction_cos": {
+    "min": -1,
+    "max": 1
+  },
+  "wind_lull": {
+    "min": 0,
+    "max": 15.624
+  },
+  "rain_accumulated": {
+    "min": 0,
+    "max": 6.602754900000001
+  }
+}

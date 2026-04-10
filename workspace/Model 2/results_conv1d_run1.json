@@ -1,0 +1,10 @@
+{
+  "name": "conv1d_run1",
+  "val_loss": 0.018692852929234505,
+  "val_mae": 0.03136131291588148,
+  "best_epoch": 13,
+  "average_mae_denormalized": 0.05649654784702011,
+  "val_rmse_denormalized": 0.07890912729611589,
+  "average_mae_celsius": 1.7483173608779907,
+  "feature_importance": []
+}

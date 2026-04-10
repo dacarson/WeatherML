@@ -1,0 +1,50 @@
+{
+  "illuminance": {
+    "min": 0,
+    "max": 159195.75
+  },
+  "solar_radiation": {
+    "min": 0,
+    "max": 1327.2
+  },
+  "uv": {
+    "min": 0,
+    "max": 13.356000000000002
+  },
+  "relative_humidity": {
+    "min": 0,
+    "max": 100
+  },
+  "station_pressure": {
+    "min": 979.987,
+    "max": 1027.353
+  },
+  "wind_avg": {
+    "min": 0,
+    "max": 5.701499999999999
+  },
+  "wind_gust": {
+    "min": 0,
+    "max": 11.109
+  },
+  "day_of_year": {
+    "min": 1,
+    "max": 366
+  },
+  "time_of_day": {
+    "min": 0,
+    "max": 24
+  },
+  "temperature_delta": {
+    "min": -1.0490053571428573,
+    "max": 1.195898214285714
+  },
+  "temp_lag1": {
+    "min": -10,
+    "max": 55
+  },
+  "humidity_lag1": {
+    "min": 0,
+    "max": 100
+  }
+}
