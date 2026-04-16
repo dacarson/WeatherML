@@ -201,6 +201,8 @@ Numba is used here for two reasons:
 
 **Model architecture diagram**: `workspace/Model 5 new arch. slope calc/weather_model_architecture.png`
 
+**Raspberry Pi deployment variant**: `workspace/Model 5a pi/` packages the same Model 5a feature set for Pi-side workflows (Edge TPU conversion, model inspection/testing, and live InfluxDB inference scripts).
+
 **Lesson learned**: **Slopes beat deltas.** A single-point difference is dominated by measurement noise. A slope over 15–30 samples captures the real trend and is far more predictive. The Numba JIT makes this computationally feasible everywhere.
 
 ---
@@ -359,6 +361,7 @@ python Inference_InfluxDB_Writer.py
     ├── Model 4a/                      # Hybrid precision experimental
     ├── Model 5/                       # Temp diff prediction
     ├── Model 5 new arch. slope calc/  # BEST MODEL — slope features
+    ├── Model 5a pi/                   # Pi-focused Model 5a training/inference tooling
     ├── Model 5b Conv2D/               # Conv2D architecture experiment
     └── Model 6/                       # Solar radiation prediction
 ```
