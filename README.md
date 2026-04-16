@@ -324,12 +324,19 @@ python Inference_InfluxDB_Writer.py
 
 ---
 
+## Additional Notes
+
+- See `dual-edge-tpu-fix.md` for a short guide to fixing dual Coral Edge TPU detection/runtime issues on Raspberry Pi deployments.
+
+---
+
 ## Project Structure
 
 ```
 .
 ├── Dockerfile.tpu                     # Docker image for training
 ├── edgetpu-x86-compiler.sh            # Compiles .tflite → _edgetpu.tflite
+├── dual-edge-tpu-fix.md               # Notes on dual Edge TPU setup/fix
 ├── run_dev.sh                         # Launches Docker dev container
 ├── SPEC.md                            # Detailed model catalog and spec
 └── workspace/
