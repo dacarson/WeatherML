@@ -1,17 +1,24 @@
 import subprocess
 import time
-import os
-
-# Remove progress.json if it exists
-if os.path.exists("progress_diff.json"):
-    os.remove("progress_diff.json")
+from influxdb import InfluxDBClient
 
 SCRIPT = "Inference_InfluxDB_Writer.py"
+MEASUREMENT = "model_5a"
+
+print(f"🧹 Dropping '{MEASUREMENT}' for fresh start...")
+try:
+    client = InfluxDBClient(host="localhost", port=8086,
+                            username="admin", password="24planet",
+                            database="weather")
+    client.query(f'DROP MEASUREMENT "{MEASUREMENT}"')
+    print(f"  ✔ Dropped '{MEASUREMENT}'")
+except Exception as e:
+    print(f"  ⚠️ Could not drop '{MEASUREMENT}': {e}")
 
 while True:
     print("🚀 Launching inference script...")
     result = subprocess.run(["python3", SCRIPT])
-    
+
     if result.returncode == 88:
         print("🔁 Restart requested by script. Waiting 2s to avoid TPU conflict...")
         time.sleep(2)

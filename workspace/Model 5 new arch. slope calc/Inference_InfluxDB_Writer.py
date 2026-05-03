@@ -21,20 +21,6 @@ EXTRA_SAMPLES = 250  # Extra buffer beyond sequence and furthest target
 # FEATURE_COUNT will be determined dynamically based on available features
 # Base: 24 features + optional wind_direction (2), wind_lull (1), rain_accumulated (1)
 
-PROGRESS_PATH = "progress_diff.json"
-
-def save_progress(last_timestamp):
-    """Persist the last *committed* prediction timestamp."""
-    with open(PROGRESS_PATH, "w") as f:
-        json.dump({"last_timestamp": last_timestamp}, f)
-
-def load_progress():
-    """Return the last committed timestamp from progress file, or None."""
-    if os.path.exists(PROGRESS_PATH):
-        with open(PROGRESS_PATH) as f:
-            return json.load(f).get("last_timestamp")
-    return None
-
 FEATURE_ORDER_BASE = [
     'uv', 'wind_avg', 'wind_gust',
     'solar_radiation', 'illuminance',
@@ -84,18 +70,23 @@ def create_influx_point(timestamp, actuals, preds, current_temp, temp_lag30):
     pred_1hr_temp = float(preds[0]) + float(current_temp)
     pred_2hr_temp = float(preds[1]) + float(current_temp)
     pred_3hr_temp = float(preds[2]) + float(current_temp)
-    
+
+    fields = {
+        "pred_1hr_temperature": pred_1hr_temp,
+        "pred_2hr_temperature": pred_2hr_temp,
+        "pred_3hr_temperature": pred_3hr_temp
+    }
+
+    # Only include actuals when future temperatures are available (historical rows)
+    if actuals is not None and not actuals.isnull().any():
+        fields["actual_1hr_temperature"] = float(actuals['temp_t+1hr'])
+        fields["actual_2hr_temperature"] = float(actuals['temp_t+2hr'])
+        fields["actual_3hr_temperature"] = float(actuals['temp_t+3hr'])
+
     return {
         "measurement": "model_5a",
         "time": timestamp.isoformat(),
-        "fields": {
-            "actual_1hr_temperature": float(actuals['temp_t+1hr']),
-            "actual_2hr_temperature": float(actuals['temp_t+2hr']),
-            "actual_3hr_temperature": float(actuals['temp_t+3hr']),
-            "pred_1hr_temperature": pred_1hr_temp,
-            "pred_2hr_temperature": pred_2hr_temp,
-            "pred_3hr_temperature": pred_3hr_temp
-        }
+        "fields": fields
     }
 
 # --- Load Scaler Parameters ---
@@ -145,62 +136,36 @@ output_index = output_details[0]['index']
 output_scale = output_details[0]['quantization'][0]
 output_zero_point = int(output_details[0]['quantization'][1])
 
-# --- Query Historic Data ---
-print("Querying data from InfluxDB...")
-drop_measurements = False
+# --- Determine Resume Point from InfluxDB ---
+print("Checking InfluxDB for last prediction timestamp...")
 last_ts = None
-progress_exists = os.path.exists(PROGRESS_PATH)
-
-# 1) Primary source of truth: progress_diff.json (if present)
-if progress_exists:
-    try:
-        with open(PROGRESS_PATH) as f:
-            progress_data = json.load(f)
-        last_ts = progress_data.get("last_timestamp")
-        if last_ts:
-            print(f"📁 Resuming from progress file; last_timestamp = {last_ts}")
-        else:
-            print("⚠️ Progress file found but last_timestamp is missing or empty.")
-    except Exception as e:
-        print(f"⚠️ Could not read progress file {PROGRESS_PATH}: {e}")
-        last_ts = None
-else:
-    # No progress file -> user wants to start from scratch
-    print("📄 progress_diff.json not found; starting full recompute from the beginning.")
-    drop_measurements = True
-
-# 2) Optional fallback to InfluxDB *only if* a progress file exists but has no usable timestamp
-if progress_exists and last_ts is None:
-    try:
-        print("🔎 Progress file unusable; checking last prediction time from InfluxDB (model_5a)...")
-        last_pred_result = writer_client.query('SELECT LAST("pred_1hr_temperature") FROM "model_5a"')
-        last_points = list(last_pred_result.get_points())
-        if last_points:
-            last_ts = last_points[0]['time']
-            drop_measurements = False  # we are continuing from existing data
-            print(f"  ✔ Found last prediction at {last_ts} (from InfluxDB)")
-        else:
-            print("  ℹ️ No previous predictions found in InfluxDB (model_5a). Will recompute from scratch.")
-            drop_measurements = True
-    except Exception as e:
-        print(f"  ⚠️ Could not determine last prediction from InfluxDB: {e}")
-        # If we got here via a bad progress file, safest is to recompute and drop old predictions
-        drop_measurements = True
-        last_ts = None
+try:
+    last_pred_result = writer_client.query('SELECT LAST("pred_1hr_temperature") FROM "model_5a"')
+    last_points = list(last_pred_result.get_points())
+    if last_points:
+        last_ts = last_points[0]['time']
+        print(f"📁 Resuming from InfluxDB; last_timestamp = {last_ts}")
+    else:
+        print("📄 No previous predictions in InfluxDB; starting from the beginning.")
+except Exception as e:
+    print(f"⚠️ Could not query InfluxDB for last prediction: {e}")
+    print("📄 Starting from the beginning.")
 
 # Only select the fields needed for feature generation and inference
 fields = "temperature, relative_humidity, station_pressure, solar_radiation, illuminance, uv, wind_avg, wind_gust, wind_direction, wind_lull, rain_accumulated"
 
 if last_ts:
-    # When resuming, pull a lookback window BEFORE last_ts so that:
-    # - We can construct a full SEQ_LEN-long sequence for the very next timestep
-    # - There are no gaps in predictions between runs.
     last_ts_dt = pd.to_datetime(last_ts)
-    resume_from_dt = last_ts_dt - pd.Timedelta(minutes=SEQ_LEN)
+    # Look back far enough to:
+    # 1. Re-process the last SEQ_LEN rows to backfill actuals now available
+    # 2. Provide a full SEQ_LEN input window for each of those backfill rows
+    # 3. Allow lag features (up to 120 min) to be valid for the oldest backfill row
+    backfill_lookback = pd.Timedelta(minutes=2 * SEQ_LEN + 120)
+    resume_from_dt = last_ts_dt - backfill_lookback
     resume_from = resume_from_dt.isoformat()
-    end_dt = resume_from_dt + pd.Timedelta(minutes=QUERY_BATCH_SIZE + EXTRA_SAMPLES)
+    end_dt = last_ts_dt + pd.Timedelta(minutes=QUERY_BATCH_SIZE + EXTRA_SAMPLES)
     end_ts = end_dt.isoformat()
-    print(f"Resuming from {last_ts_dt} with lookback starting at {resume_from_dt}")
+    print(f"Resuming from {last_ts_dt} with backfill lookback to {resume_from_dt}")
     query = f'SELECT {fields} FROM "wf/obs_st" WHERE time >= \'{resume_from}\' AND time <= \'{end_ts}\''
 else:
     # No usable timestamp -> full backfill; get earliest timestamp first (safe 1-point query)
@@ -323,10 +288,10 @@ print(df[['temp_t+1hr', 'temp_t+2hr', 'temp_t+3hr']].isna().sum())
 print("\n🧪 Total rows before processing:", len(df))
 
 # Process the data but keep the extra rows for target validation
-required_fields = FEATURE_ORDER + ['temp_t+1hr', 'temp_t+2hr', 'temp_t+3hr']
+required_fields = FEATURE_ORDER
 
-# For inference, we only process up to the point where we have complete targets
-# This ensures we can validate predictions against actual future values
+# Drop rows where input features are incomplete (e.g. early rows with NaN lags).
+# Rows with NaN targets (last 3 hours) are kept — predictions are made without actuals.
 df.dropna(subset=required_fields, inplace=True)
 # Optimize memory usage: convert float64 to float32
 float_cols = df.select_dtypes(include=['float64']).columns
@@ -341,26 +306,20 @@ print("Running inference...")
 inference_times = []
 prediction_points = []
 
-if drop_measurements:
-    print("🧹 Dropping old prediction measurements...")
-    try:
-        writer_client.query('DROP MEASUREMENT "model_5a"')
-        print('  ✔ Dropped measurement: model_5a')
-    except Exception as e:
-        print(f"  ⚠️ Could not drop model_5a: {e}")
-
 start_index = 0
 if last_ts:
     try:
-        start_index = df.index.get_loc(pd.to_datetime(last_ts)) + 1
-    except KeyError:
+        # Go back SEQ_LEN rows before last_ts to re-process predictions that
+        # now have actuals available. InfluxDB will merge the actual_* fields
+        # into the existing points without overwriting the pred_* fields.
+        backfill_from = pd.to_datetime(last_ts) - pd.Timedelta(minutes=SEQ_LEN)
+        start_index = df.index.searchsorted(backfill_from)
+    except Exception:
         start_index = 0
 
 resume_time = df.index[start_index] if start_index < len(df) else "N/A"
-# Need SEQ_LEN timesteps for the sequence, plus we need to be able to access targets
-# Target at index i requires data from i-SEQ_LEN+1 to i (inclusive), so we need i >= SEQ_LEN-1
 min_start = max(start_index, SEQ_LEN - 1)
-print(f"🔁 Resuming from index {min_start} / {len(df) - 1} at {resume_time}")
+print(f"🔁 Resuming from index {min_start} / {len(df) - 1} at {resume_time} (backfilling 3 hrs of actuals)")
 print(f"📊 Using sequence length of {SEQ_LEN} timesteps (3 hours of history)")
 
 for i in range(min_start, len(df)):
@@ -370,22 +329,19 @@ for i in range(min_start, len(df)):
     window_df = df.iloc[window_start:i+1]  # i+1 because iloc is exclusive on the end
     target_idx = i
     targets = df.iloc[target_idx][['temp_t+1hr', 'temp_t+2hr', 'temp_t+3hr']]
+    actuals = None if targets.isnull().any() else targets
 
     # Normalize - window_df should have exactly SEQ_LEN rows
     if len(window_df) != SEQ_LEN:
         print(f"⚠️ Skipping row {i}: insufficient data for sequence (have {len(window_df)}, need {SEQ_LEN})")
         continue
-    
+
     window = window_df[FEATURE_ORDER].values  # Shape: (SEQ_LEN, FEATURE_COUNT)
     scaled_window = np.empty_like(window)
     for j, feature in enumerate(FEATURE_ORDER):
         f_min = input_scaler[feature]["min"]
         f_max = input_scaler[feature]["max"]
         scaled_window[:, j] = (window[:, j] - f_min) / (f_max - f_min)
-
-    if targets.isnull().any():
-        print(f"⚠️ Skipping row {i} due to NaNs in targets: {targets}")
-        continue
 
     try:
         preds, t_inf = predict_on_window(scaled_window, interpreter, input_index, output_index)
@@ -400,7 +356,7 @@ for i in range(min_start, len(df)):
         timestamp = df.index[target_idx]
         current_temp = df.iloc[target_idx]['temperature']
         temp_lag30 = df.iloc[target_idx]['temp_lag30']
-        prediction_points.append(create_influx_point(timestamp, targets, preds, current_temp, temp_lag30))
+        prediction_points.append(create_influx_point(timestamp, actuals, preds, current_temp, temp_lag30))
 
         # Write every (BATCH_SIZE / 4) predictions
         if len(inference_times) % (BATCH_SIZE / 4) == 0:
@@ -410,14 +366,6 @@ for i in range(min_start, len(df)):
             print(f"  Max Inference Time: {np.max(inference_times):.2f} ms")
 
             writer_client.write_points(prediction_points, time_precision='ms')
-
-            # Update progress file to reflect the last *flushed* prediction timestamp
-            last_flushed_ts = prediction_points[-1]["time"]
-            try:
-                save_progress(last_flushed_ts)
-            except Exception as e:
-                print(f"  ⚠️ Could not update progress file {PROGRESS_PATH}: {e}")
-
             prediction_points = []
 
         # Reset interpreter every 10k runs to avoid TPU HIB errors
@@ -449,11 +397,5 @@ for i in range(min_start, len(df)):
 # Final flush
 if prediction_points:
     writer_client.write_points(prediction_points, time_precision='ms')
-    # Ensure progress file reflects the last committed prediction
-    last_flushed_ts = prediction_points[-1]["time"]
-    try:
-        save_progress(last_flushed_ts)
-    except Exception as e:
-        print(f"⚠️ Could not update progress file {PROGRESS_PATH} on final flush: {e}")
 
 print("✅ Inference complete.")
