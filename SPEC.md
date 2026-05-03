@@ -4,20 +4,20 @@
 
 This project trains ML models on Tempest Weather Station data to predict future temperatures at **+1hr**, **+2hr**, and **+3hr** horizons. Models are trained on a MacBook Pro, quantized to INT8 TFLite, compiled for the Coral Edge TPU, and deployed for inference on a Raspberry Pi.
 
-### Strategic goal (raw-sequence inference on Edge TPU)
+### Strategic goal (Conv1D on Edge TPU with explicit lag features)
 
-The **overall product goal** is to avoid **pre-calculating derived features** (for example explicit lag columns such as `temp_lag30`, `humidity_lag60`, or other hand-built transforms in Python or in the inference path). Instead, the system should feed the model a **single 180-minute window** of appropriately scaled **raw (or minimally processed) station readings**—i.e. the same time span models like Model 5 already use as context—and let the network learn temporal structure internally.
+The **overall product goal** is to match or beat Model 5a accuracy (val_loss ≤ 0.000682) using a Conv1D architecture that runs on the Coral Edge TPU.
 
-**Success criterion**: validation quality **at least as good as Model 5a** (see Model 5 new arch. in this spec: strong `val_loss` / `val_mae` on the multi-horizon temperature-difference task), while meeting the “no pre-computed lag features” constraint in training and at deploy time, **and the compiled model must run on the Coral Edge TPU**.
+**Retired goal (Exp 9–25, 2026-04-30)**: The original goal was to avoid all pre-computed lag features and let the network learn temporal structure purely from a raw 180-minute window. After 25 experiments across 9 months, this goal is retired. Experiments consistently showed `temperature` ranking 17th–19th out of 19 features in importance while `time_of_day` and `solar_radiation` dominated — producing predictions that follow the expected diurnal curve rather than actual temperature, causing a visible phase lag vs. reality. The 2× accuracy gap vs. Model 5a (best Conv1D: 0.001343 vs. 0.000682) is structural, not tunable: diurnal signals are too strong for the Conv1D to learn implicit temperature anchoring when explicit lag columns are absent. The no-precomputed-lags constraint is incompatible with Model 5a accuracy under the Edge TPU op restrictions.
+
+**Current success criterion**: validation quality **at least as good as Model 5a** (val_loss ≤ 0.000682, val_mae ≤ 0.00445), with `temp_lag60` and `temp_lag120` as explicit input features, **and the compiled model must run on the Coral Edge TPU**.
 
 **Edge TPU constraints** (hard requirements for any candidate architecture):
 - All ops must be INT8-quantizable and Edge TPU-compilable (no LSTM, GRU, or standard attention — these are not supported)
 - Supported ops: `Conv1D`, `Conv2D`, `DepthwiseConv2D`, `Dense`, `ReLU`, `ReLU6`, `GlobalAveragePooling`, `Add`, `Concatenate`, `Reshape`, `BatchNormalization`
 - Model must survive `edgetpu_compiler` with all ops mapped to the TPU (no CPU-fallback ops)
-- INT8 quantization via representative dataset must not cause significant accuracy degradation
+- INT8 quantization must not cause significant accuracy degradation (QAT required — PTQ has failed Exp 12–25 due to unbounded intermediate Conv1D activations)
 - Practical model size limit: Edge TPU has 8 MB of SRAM; compiled model + parameters must fit
-
-Note: cyclical encodings of calendar time (e.g. `sin`/`cos` of time-of-day) are a gray area—count as “hand features” unless the model consumes raw timestamps and learns periodicity. The north-star is **minimal feature engineering**: longest term, ideally only normalization + stacking the 180-minute tensor.
 
 ---
 
@@ -42,7 +42,9 @@ Note: cyclical encodings of calendar time (e.g. `sin`/`cos` of time-of-day) are 
 2. **Quantize** — Convert to INT8 TFLite (representative dataset quantization)
 3. **Compile** — `edgetpu_compiler` (via Docker container) produces `_edgetpu.tflite`
 4. **Deploy** — Copy `_edgetpu.tflite` + scaler JSON files to Raspberry Pi
-5. **Infer** — `Inference_InfluxDB_Writer.py` reads live data, runs model on Coral Edge TPU, writes predictions to InfluxDB
+5. **Infer** — `Inference_InfluxDB_Writer.py` reads live data, runs model on Coral Edge TPU, writes predictions to InfluxDB. Two run modes:
+   - **`run_with_restart.py`** — full recompute from scratch; deletes `progress_diff.json`, drops the `model_5a` measurement, and rebuilds all predictions from the beginning of the dataset.
+   - **`python3 Inference_InfluxDB_Writer.py` directly** — incremental run; resumes from `progress_diff.json`. On each run it re-processes the last 3 hours to backfill `actual_*` fields that are now available, then continues writing new predictions up to the present. The most recent ~3 hours of points will always have predictions only (no actuals), since the model predicts up to 3 hours ahead and the actual future temperatures do not yet exist.
 
 ---
 
@@ -430,7 +432,7 @@ Metrics reported are the best run's normalized `val_loss` (MSE) and `val_mae`. A
 
 2. **Slope/rate features beat delta features** — The single biggest accuracy jump (Model 5 → Model 5 slope calc, 15× improvement) came from replacing raw deltas with Numba-computed slopes over multiple windows.
 
-3. **Explicit lag features are essential** — `temp_lag1`, `temp_lag30/60/120` dominate feature importance across all models. Conv layers do not learn these implicitly as well as providing them explicitly.
+3. **Explicit lag features are essential** — `temp_lag1`, `temp_lag30/60/120` dominate feature importance across all models. Conv layers do not learn these implicitly: 25 Conv1D experiments (Exp 9–25, Model 5b) confirmed that without explicit lag columns the model learns the diurnal curve instead of actual temperature dynamics, producing a visible phase lag and a persistent 2× accuracy gap vs. Model 5a.
 
 4. **Cyclical time encoding matters** — `time_of_day_sin/cos` and `day_of_year_sin/cos` are consistently high-importance features. Raw `time_of_day` as a scalar is inferior.
 
@@ -451,7 +453,9 @@ Metrics reported are the best run's normalized `val_loss` (MSE) and `val_mae`. A
    ```
    Without this, each iteration runs a Python `for` loop over all features × `SEQ_LEN` rows (e.g. 18 features × 180 steps = 3240 Python ops per prediction), saturating the CPU despite the TPU completing inference in ~0.55 ms. Pre-normalizing reduces the per-iteration work to a single numpy stride, cutting CPU usage dramatically.
 
-9. **InfluxDB `max-select-point` is a scan limit, not a result limit** — The server counts every point *examined* before applying `LIMIT`, so a query like `LIMIT 100000` will still fail if the measurement contains more than 100k points. The correct pattern (matching Model 5's approach) is to use bounded time-range queries:
+9. **Inference writes predictions immediately; actuals backfill on the next run** — `Inference_InfluxDB_Writer.py` does not require future temperature data to exist before making a prediction. Each run writes `pred_*` fields for every row up to now. On the following run, the script re-processes the last 3 hours (`SEQ_LEN` rows) and merges the now-available `actual_*` fields into those existing InfluxDB points. This means there is always a trailing 3-hour window with predictions but no actuals — this is expected and correct. To support this, the resume query fetches `2×SEQ_LEN + 120` minutes of lookback (enough for the backfill window's input sequences and lag features).
+
+10. **InfluxDB `max-select-point` is a scan limit, not a result limit** — The server counts every point *examined* before applying `LIMIT`, so a query like `LIMIT 100000` will still fail if the measurement contains more than 100k points. The correct pattern (matching Model 5's approach) is to use bounded time-range queries:
    - Query `SELECT FIRST(...)` (1 point) to find the dataset start, then fetch `WHERE time >= start AND time <= start + QUERY_BATCH_SIZE + EXTRA_SAMPLES minutes`
    - After `BATCH_SIZE` inferences, exit with code 88 so `run_with_restart.py` relaunches and advances the window via `progress_diff.json`
    - This keeps each query well within the server scan limit (~70 days ≈ 100k points at 1 obs/min)
