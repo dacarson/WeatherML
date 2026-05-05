@@ -13,11 +13,7 @@
 
 ---
 
-## Root Causes
-
-Two independent bugs must both be fixed for both TPUs to work when booting from NVMe.
-
-### Bug 1 — MSI vector exhaustion (affects SD and NVMe boot equally)
+## Root Cause
 
 The BCM2712 PCIe controller on the Pi 5 provides a single MSI domain with **32 slots**.
 
@@ -32,25 +28,7 @@ The original driver (`pcie-brcmstb.c`) used `bitmap_find_free_region()` which al
 
 With the non-aligned `bitmap_find_next_zero_area()` patch, TPU 1 could fit into slots 22–31 (10 slots) — but still failed because **10 < 13**.
 
-The complete MSI fix required three changes working together (bitmap allocator patch, ASM1182e MSI quirk, and `pci=noaer`).
-
-### Bug 2 — PCIe subordinate bus capping (affects NVMe boot only)
-
-When booting from NVMe, the Pi 5 bootloader must enumerate the PCIe bus to find the NVMe drive. It programs the PCIe bridge subordinate registers just far enough to reach the NVMe (bus 03), setting subordinate=04 as a conservative ceiling, then hands that frozen state to Linux.
-
-The Dual Edge TPU's internal topology requires buses 04–07:
-- Bus 04: ASM1182e upstream port (inside the Dual TPU module)
-- Bus 05: ASM1182e downstream ports level
-- Bus 06: TPU 0 endpoint
-- Bus 07: TPU 1 endpoint
-
-With subordinate frozen at 04, Linux cannot expand the bus range and the TPU endpoints on buses 06–07 are never discovered.
-
-When booting from SD card, the bootloader does not enumerate PCIe at all, so Linux programs the subordinate registers freely from scratch — which is why SD boot worked without this fix.
-
-The root cause in the kernel is in `pci_scan_bridge_extend()` in `drivers/pci/probe.c`. When bridge secondary/subordinate registers are already programmed (as set by the bootloader), Linux takes the `!pcibios_assign_all_busses()` branch and trusts the firmware-assigned values as hard constraints. Setting the `PCI_REASSIGN_ALL_BUS` flag forces Linux to ignore firmware-assigned bus numbers and reassign everything freely.
-
-The flag is set by adding `pci_add_flags(PCI_REASSIGN_ALL_BUS)` to `brcm_pcie_probe()` in the brcmstb driver, immediately before `pci_host_probe()` — the same pattern used by `pci-versatile.c` and `pcie-rcar-host.c`.
+The complete fix required three changes working together.
 
 ---
 
@@ -79,23 +57,12 @@ The stock configuration had `pcie-msi-32` DT overlay active (4 GIC lines, domain
 | `pci=nomsi` kernel param | Caused boot failure — NVMe or PCIe switch requires legacy MSI during initialization |
 | Expanding MSI domain to 64 slots | Not possible — BCM2712 hardware uses a single 32-bit `MSI_INT_STATUS` register; domain is physically capped at 32 |
 | Confirming NVMe/apex domain separation | NVMe MSI base `135790592` and apex MSI base `137363456` are confirmed separate domains — NVMe vectors do not consume apex slots |
-| `pci=pcie_bus_performance` in cmdline.txt | `pcie_bus_safe` is hardcoded in `chosen/bootargs` in the BCM2712 base DTB — firmware concatenates both strings, `pcie_bus_safe` appears first and wins for subordinate assignment |
-| DT overlay overriding `chosen/bootargs` | Firmware appends rather than replaces — both bootargs strings end up in the kernel command line |
-| DT overlay setting `brcm,clkreq-mode = "default"` | Successfully applied (confirmed in live DT) but did not stop subordinate capping — clkreq-mode is not the trigger |
-| `pciex4_reset=0` in config.txt | Documented for RP1 PCIe (internal `0002:` domain), not the external PCIe connector (`0001:` domain) — no effect |
-| `pcie_bus_safe=0` in config.txt | Not a recognised firmware config option — no effect |
-| `pci=assign-busses` kernel param | Sets `PCI_REASSIGN_ALL_BUS` flag via command line, but is processed too late — `pci_bus_insert_busn_res()` has already locked in the firmware-assigned subordinate=04 constraint before the flag is evaluated |
-| EEPROM `PCIE_SUBORDINATE` option | Does not exist — no documented bootloader option controls subordinate bus allocation depth during NVMe probe |
 
 ---
 
 ## Changes Made
 
-### 1. Bitmap allocator patch + `PCI_REASSIGN_ALL_BUS` — `drivers/pci/controller/pcie-brcmstb.c`
-
-Two changes to this file, both applied in the DKMS patched source at `/usr/src/pcie-brcmstb-patched-1.0/pcie-brcmstb.c`.
-
-#### 1a. Replace the MSI bitmap allocator
+### 1. Bitmap allocator patch — `drivers/pci/controller/pcie-brcmstb.c`
 
 Replace the power-of-2 aligned allocator with a contiguous-area allocator, and fix the failure return path:
 
@@ -136,29 +103,6 @@ static void brcm_msi_free(struct brcm_msi *msi, unsigned long hwirq,
 ```
 
 **Key detail:** `bitmap_find_next_zero_area()` returns `nbits` (not a negative number) on failure. The original patch used `if (hwirq >= 0)` which is always true and would call `bitmap_set()` out of bounds on failure. The correct check is `if (hwirq < msi->nr)`.
-
-#### 1b. Set `PCI_REASSIGN_ALL_BUS` before `pci_host_probe()`
-
-In `brcm_pcie_probe()`, add `pci_add_flags(PCI_REASSIGN_ALL_BUS)` immediately before the `pci_host_probe(bridge)` call (around line 2566):
-
-```c
-    platform_set_drvdata(pdev, pcie);
-
-    /* Force Linux to ignore firmware-assigned subordinate bus numbers and
-     * reassign them freely. Required when booting from NVMe: the bootloader
-     * pre-programs bridge subordinate registers to just reach the NVMe
-     * (capping at bus 04), which prevents discovery of the Dual Edge TPU
-     * endpoints on buses 06-07. pci=assign-busses in cmdline.txt is
-     * ineffective because it is processed after pci_bus_insert_busn_res()
-     * has already locked in the firmware constraints. Setting the flag here,
-     * in the driver probe function before pci_host_probe(), ensures it is
-     * active before any bus scanning begins. Same pattern as pci-versatile.c
-     * and pcie-rcar-host.c. */
-    pci_add_flags(PCI_REASSIGN_ALL_BUS);
-    ret = pci_host_probe(bridge);
-```
-
-`linux/pci.h` is already included in the file so no additional include is needed.
 
 #### Build process
 
@@ -231,32 +175,12 @@ cp arch/arm64/boot/Image.gz /boot/firmware/kernel8.img
 Add `pci=noaer` to remove AER (Advanced Error Reporting) interrupt allocations from PCIe bridge ports:
 
 ```
-console=serial0,115200 console=tty1 root=PARTUUID=eabf1ada-02 rootfstype=ext4 fsck.repair=yes rootwait cfg80211.ieee80211_regdom=US quiet splash plymouth.ignore-serial-consoles pci=noaer
+console=serial0,115200 console=tty1 root=PARTUUID=30b7eac3-02 rootfstype=ext4 fsck.repair=yes rootwait cfg80211.ieee80211_regdom=US quiet splash plymouth.ignore-serial-consoles pci=noaer
 ```
 
 **Note:** `pci=nomsi` was also tested but caused a boot failure — the NVMe or PCIe switch requires legacy MSI during initialization. `pci=noaer` alone (removing AER) is safe.
 
 ---
-
-## Final PCIe Bus Layout (NVMe boot)
-
-After the `PCI_REASSIGN_ALL_BUS` fix, Linux freely assigns bus numbers:
-
-```
-[0001:00]---00.0-[01-07]----00.0-[02-07]--+-03.0-[03]----00.0  Realtek NVMe SSD
-                                           \-07.0-[04-07]----00.0-[05-07]--+-03.0-[06]----00.0  Coral Edge TPU
-                                                                           \-07.0-[07]----00.0  Coral Edge TPU
-```
-
-| Bus | Device |
-|---|---|
-| 01 | ASM1182e upstream port |
-| 02 | ASM1182e downstream ports (03 and 07) |
-| 03 | NVMe SSD endpoint |
-| 04 | ASM1182e upstream port (inside Dual TPU module) |
-| 05 | ASM1182e downstream ports (inside Dual TPU module) |
-| 06 | TPU 0 endpoint (`apex0`) |
-| 07 | TPU 1 endpoint (`apex1`) |
 
 ## Final MSI Slot Layout
 
@@ -286,16 +210,8 @@ cat /proc/interrupts | grep apex | wc -l
 dmesg | grep "brcm-msi"
 # Expected: alloc lines starting at hwirq=5, then hwirq=18
 
-# Confirm bus numbers assigned freely (no capping errors)
-dmesg | grep "busn\|subordinate"
-# Expected: [bus 03-ff], [bus 06-ff], [bus 07-ff] etc — all open-ended
-
 # Confirm no initialization errors
 dmesg | grep -E "apex|Couldn't initialize|ENOSPC"
-
-# Benchmark both TPUs
-python3 tpu_benchmark.py
-# Expected: ~370 FPS on both TPUs, delta < 0.1 ms
 ```
 
 ---
@@ -315,17 +231,67 @@ The original kernel is backed up at `/boot/kernel8.img.orig`.
 
 `auto_initramfs=1` in `config.txt` maps `kernel8.img` → `initramfs8` automatically by name convention.
 
-**NVMe boot safety:** `CONFIG_BLK_DEV_NVME=y` — the NVMe driver is built into the kernel, not a module. Combined with `root=PARTUUID=...` (partition UUID, not bus path), `PCI_REASSIGN_ALL_BUS` is safe to use even when booting from NVMe. Bus numbers may be reassigned but the root filesystem is always found by UUID.
-
 ---
 
 ## Maintenance
 
-The DKMS module (`pcie-brcmstb-patched 1.0`) will auto-rebuild on kernel updates via `dkms autoinstall`. However, the custom kernel image at `/boot/firmware/kernel8.img` will be overwritten by `apt upgrade` if the `linux-image` package is updated. Options:
+### Kernel package pinning (do this once)
 
-- Pin the kernel package: `apt-mark hold linux-image-6.12.75+rpt-rpi-v8`
-- Or rebuild `Image.gz` and redeploy after any kernel upgrade
+Pin both the kernel image and headers to prevent `apt upgrade` from overwriting the custom `kernel8.img` or triggering DKMS rebuilds against a new kernel version:
 
-The `quirks.c` change and `CONFIG_PCIE_BRCMSTB=m` config change live in `/usr/src/linux-source-6.12/` and must be reapplied if the source package is updated.
+```bash
+sudo apt-mark hold linux-image-6.12.75+rpt-rpi-v8
+sudo apt-mark hold linux-headers-6.12.75+rpt-rpi-v8
+```
 
-**Unnecessary overlays to clean up:** During debugging, two DT overlays were added to `/boot/firmware/overlays/` and referenced in `config.txt` — `pcie-clkreq-default` and `pcie-bus-performance`. These were attempts to work around the subordinate capping and are no longer needed now that `PCI_REASSIGN_ALL_BUS` is set in the driver. They can be removed from `config.txt` (the `.dtbo` files are harmless but can also be deleted).
+### Running `apt upgrade`
+
+`apt upgrade` can destabilize the DKMS state even with the kernel pinned, because unrelated header packages trigger DKMS autoinstall against every kernel that has headers installed. The safest upgrade procedure is:
+
+1. Run `apt upgrade` as normal — expect DKMS build failures for non-6.12 kernels in the output; these are harmless
+2. After the upgrade completes, check DKMS state:
+   ```bash
+   dkms status
+   ls /lib/modules/6.12.75+rpt-rpi-v8/updates/dkms/
+   # Must show: apex.ko.xz  gasket.ko.xz  pcie-brcmstb.ko.xz
+   ```
+3. If `gasket` or `apex` are missing, rebuild manually (see gasket patches below)
+4. Reboot and run the verification commands
+
+**Watch out for:** apt removing `gasket-dkms` as part of a dependency chain (e.g. when removing old header packages). If this happens, reinstall with `sudo apt install gasket-dkms` and reapply the gasket patches below before rebuilding.
+
+### Gasket source patches required for kernel 6.12+
+
+The `gasket-dkms` 1.0-18 package from the Coral repo has three API incompatibilities with kernel 6.12. These patches must be applied to `/var/lib/dkms/gasket/1.0/source/` whenever gasket is reinstalled from scratch:
+
+```bash
+# 1. no_llseek removed in 6.12 — use noop_llseek
+sudo sed -i 's/no_llseek/noop_llseek/g' \
+    /var/lib/dkms/gasket/1.0/source/gasket_core.c
+
+# 2. class_create() no longer takes a module owner argument (removed in 6.6+)
+sudo sed -i 's/class_create(driver_desc->module, /class_create(/g' \
+    /var/lib/dkms/gasket/1.0/source/gasket_core.c
+
+# 3. eventfd_signal() no longer takes a count argument (removed in 6.10+)
+sudo sed -i 's/eventfd_signal(ctx, 1)/eventfd_signal(ctx)/g' \
+    /var/lib/dkms/gasket/1.0/source/gasket_interrupt.c
+```
+
+After patching, rebuild and install:
+
+```bash
+sudo dkms build gasket/1.0 -k 6.12.75+rpt-rpi-v8
+sudo dkms install gasket/1.0 -k 6.12.75+rpt-rpi-v8
+```
+
+### pcie-brcmstb-patched and kernel image
+
+The DKMS module (`pcie-brcmstb-patched 1.0`) will auto-rebuild on kernel updates via `dkms autoinstall`. However, the custom kernel image at `/boot/firmware/kernel8.img` will be overwritten by `apt upgrade` if the `linux-image` package is updated (pinning above prevents this). If a kernel upgrade is intentional:
+
+- Rebuild `Image.gz` with the `quirks.c` patch and `CONFIG_PCIE_BRCMSTB=m` and redeploy
+- The `quirks.c` change and `CONFIG_PCIE_BRCMSTB=m` config change live in `/usr/src/linux-source-6.12/` and must be reapplied if the source package is updated
+
+### Cleaning up old kernel headers
+
+Old header packages (`linux-headers-6.1.x-*`, `linux-kbuild-6.1`, etc.) accumulate over time and cause spurious DKMS build failures during `apt upgrade`. They are safe to remove with `apt autoremove`, but **watch the package list carefully** — apt may include `gasket-dkms` in the removal if `raspberrypi-kernel-headers` is also being removed (due to a declared dependency). If that happens, answer `n`, remove the header packages explicitly without `gasket-dkms`, then reinstall `gasket-dkms` and reapply the patches above.
