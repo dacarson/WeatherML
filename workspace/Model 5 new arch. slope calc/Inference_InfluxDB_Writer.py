@@ -65,29 +65,32 @@ def predict_on_window(window, interpreter, input_index, output_index):
     inference_time_ms = (time.perf_counter() - start) * 1000
     return output_rescaled, inference_time_ms
 
-def create_influx_point(timestamp, actuals, preds, current_temp, temp_lag30):
+def create_influx_points(base_timestamp, actuals, preds, current_temp, temp_lag30):
     # preds are temperature differences, so add current temperature to get actual predicted temperatures
+    # Each prediction is stored at its TARGET timestamp (base_timestamp + horizon) so that
+    # the graph shows predictions extending into the future rather than ending at "now".
     pred_1hr_temp = float(preds[0]) + float(current_temp)
     pred_2hr_temp = float(preds[1]) + float(current_temp)
     pred_3hr_temp = float(preds[2]) + float(current_temp)
 
-    fields = {
-        "pred_1hr_temperature": pred_1hr_temp,
-        "pred_2hr_temperature": pred_2hr_temp,
-        "pred_3hr_temperature": pred_3hr_temp
-    }
+    horizons = [
+        (1, pred_1hr_temp, 'temp_t+1hr'),
+        (2, pred_2hr_temp, 'temp_t+2hr'),
+        (3, pred_3hr_temp, 'temp_t+3hr'),
+    ]
 
-    # Only include actuals when future temperatures are available (historical rows)
-    if actuals is not None and not actuals.isnull().any():
-        fields["actual_1hr_temperature"] = float(actuals['temp_t+1hr'])
-        fields["actual_2hr_temperature"] = float(actuals['temp_t+2hr'])
-        fields["actual_3hr_temperature"] = float(actuals['temp_t+3hr'])
-
-    return {
-        "measurement": "model_5a",
-        "time": timestamp.isoformat(),
-        "fields": fields
-    }
+    points = []
+    for hrs, pred_temp, actual_key in horizons:
+        future_ts = base_timestamp + pd.Timedelta(hours=hrs)
+        fields = {f"pred_{hrs}hr_temperature": pred_temp}
+        if actuals is not None and not pd.isna(actuals[actual_key]):
+            fields[f"actual_{hrs}hr_temperature"] = float(actuals[actual_key])
+        points.append({
+            "measurement": "model_5a",
+            "time": future_ts.isoformat(),
+            "fields": fields
+        })
+    return points
 
 # --- Load Scaler Parameters ---
 print("Loading input scaler...")
@@ -156,16 +159,18 @@ fields = "temperature, relative_humidity, station_pressure, solar_radiation, ill
 
 if last_ts:
     last_ts_dt = pd.to_datetime(last_ts)
+    # Predictions are stored at T+1hr (the target time), so convert back to input time T
+    last_input_ts_dt = last_ts_dt - pd.Timedelta(hours=1)
     # Look back far enough to:
     # 1. Re-process the last SEQ_LEN rows to backfill actuals now available
     # 2. Provide a full SEQ_LEN input window for each of those backfill rows
     # 3. Allow lag features (up to 120 min) to be valid for the oldest backfill row
     backfill_lookback = pd.Timedelta(minutes=2 * SEQ_LEN + 120)
-    resume_from_dt = last_ts_dt - backfill_lookback
+    resume_from_dt = last_input_ts_dt - backfill_lookback
     resume_from = resume_from_dt.isoformat()
-    end_dt = last_ts_dt + pd.Timedelta(minutes=QUERY_BATCH_SIZE + EXTRA_SAMPLES)
+    end_dt = last_input_ts_dt + pd.Timedelta(minutes=QUERY_BATCH_SIZE + EXTRA_SAMPLES)
     end_ts = end_dt.isoformat()
-    print(f"Resuming from {last_ts_dt} with backfill lookback to {resume_from_dt}")
+    print(f"Resuming from {last_input_ts_dt} (pred stored at {last_ts_dt}) with backfill lookback to {resume_from_dt}")
     query = f'SELECT {fields} FROM "wf/obs_st" WHERE time >= \'{resume_from}\' AND time <= \'{end_ts}\''
 else:
     # No usable timestamp -> full backfill; get earliest timestamp first (safe 1-point query)
@@ -309,10 +314,9 @@ prediction_points = []
 start_index = 0
 if last_ts:
     try:
-        # Go back SEQ_LEN rows before last_ts to re-process predictions that
-        # now have actuals available. InfluxDB will merge the actual_* fields
-        # into the existing points without overwriting the pred_* fields.
-        backfill_from = pd.to_datetime(last_ts) - pd.Timedelta(minutes=SEQ_LEN)
+        # Predictions are stored at T+1hr; convert back to input time T before backfilling
+        last_input_ts = pd.to_datetime(last_ts) - pd.Timedelta(hours=1)
+        backfill_from = last_input_ts - pd.Timedelta(minutes=SEQ_LEN)
         start_index = df.index.searchsorted(backfill_from)
     except Exception:
         start_index = 0
@@ -329,7 +333,7 @@ for i in range(min_start, len(df)):
     window_df = df.iloc[window_start:i+1]  # i+1 because iloc is exclusive on the end
     target_idx = i
     targets = df.iloc[target_idx][['temp_t+1hr', 'temp_t+2hr', 'temp_t+3hr']]
-    actuals = None if targets.isnull().any() else targets
+    actuals = targets  # each horizon's actual is written independently if available
 
     # Normalize - window_df should have exactly SEQ_LEN rows
     if len(window_df) != SEQ_LEN:
@@ -356,7 +360,7 @@ for i in range(min_start, len(df)):
         timestamp = df.index[target_idx]
         current_temp = df.iloc[target_idx]['temperature']
         temp_lag30 = df.iloc[target_idx]['temp_lag30']
-        prediction_points.append(create_influx_point(timestamp, actuals, preds, current_temp, temp_lag30))
+        prediction_points.extend(create_influx_points(timestamp, actuals, preds, current_temp, temp_lag30))
 
         # Write every (BATCH_SIZE / 4) predictions
         if len(inference_times) % (BATCH_SIZE / 4) == 0:
