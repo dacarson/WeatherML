@@ -27,6 +27,80 @@ Once float val_loss ≤ 0.000682, apply QAT (Quantization-Aware Training) to pro
 
 ---
 
+## Model 5a Reference Baseline
+
+Model 5a is the benchmark this project targets. These numbers are the concrete reference for all accuracy comparisons.
+
+| Metric | Value |
+|--------|-------|
+| val_loss | **0.000682** |
+| val_mae (normalized) | **0.00445** |
+| Best epoch | 97 |
+| Model size | 788 KB |
+| Top feature | `temp_lag120` (importance 0.093) |
+| Architecture | Wide-deep-interaction dense, no Conv layers |
+| Target scaler (`target_scaler_5a.json`) | min=−18.54°C, max=17.53°C, range=36.07°C |
+| INT8 step size | 0.141°C/step (36.07°C ÷ 256) |
+| **Deployed StdDev (4.5 years of live data)** | **0.145°C ≈ 1.0 INT8 step** |
+
+The deployed StdDev of exactly 1 INT8 step is a useful calibration point: it shows how close a well-quantized model can come to the quantization floor, and sets the practical lower bound for what Model 5b should aim for.
+
+---
+
+## INT8 Output Precision & StdDev Analysis
+
+### Current target_scaler_5b.json
+
+`target_scaler_5b.json` is **recalculated every training run** (line 598 of `train_model_conv2D.py`) from the global min/max of all three diff targets (`temp_diff_1hr/2hr/3hr`) across the training data after gap detection, with a fixed ±2°C padding. It will produce identical results each run as long as the training data does not change — the computation is fully deterministic.
+
+| Metric | Value |
+|--------|-------|
+| Current scaler | min=−13.36°C, max=15.09°C, range=**28.45°C** |
+| INT8 step size | **0.111°C/step** (28.45°C ÷ 256) |
+| Quantization noise floor (theoretical) | 0.032°C StdDev |
+
+The tighter range compared to Model 5a (28.45°C vs 36.07°C) is an advantage: each INT8 step is finer (0.111°C vs 0.141°C), giving better output resolution if the model is accurate enough to exploit it.
+
+### StdDev Benchmarks (measured over 4.5 years of live InfluxDB data)
+
+| Scenario | StdDev | INT8 steps |
+|----------|--------|-----------|
+| Model 5a deployed (INT8 TPU) | **0.145°C** | 1.0 |
+| Model 5b current (float, unfinished) | **0.333°C** | 3.0 |
+| Model 5b best PTQ INT8 (Exp 30, 1hr) | ~0.8–1.0°C est. | ~7–9 |
+| Model 5b with QAT, current float ceiling (~0.0026 val_loss) | ~0.15–0.25°C est. | ~1.4–2.3 |
+| Model 5b with QAT, if float target met (≤ 0.000682 val_loss) | **~0.10–0.14°C est.** | ~0.9–1.3 |
+| Theoretical INT8 floor (perfect model) | 0.032°C | 0.3 |
+
+**Conclusion**: if Model 5b meets the float accuracy target and QAT is applied, it should reach **~0.10–0.14°C StdDev** — marginally better than Model 5a's 0.145°C because of the finer INT8 step size. The practical floor is approximately 1 INT8 step (0.111°C). The current PTQ gap of 3–4× in MAE (float→INT8) must be closed by QAT; PTQ alone has never produced a deployable result for this architecture.
+
+### ⚠️ Palm Springs Data Warning
+
+The current `target_scaler_5b.json` is computed from **San Francisco training data only**. Palm Springs has substantially different climate characteristics:
+
+| | San Francisco | Palm Springs |
+|--|--|--|
+| Temperature range (training data) | −4.6 to 34.4°C | 3.2 to **50.1°C** |
+| Diurnal swing | Moderate (marine influence, fog) | Extreme (desert, 20–30°C/day typical) |
+| Training data diff range (1/2/3hr, full dataset) | −14.9 to 15.5°C | −13.4 to 16.7°C |
+
+If Palm Springs data is included in training, the combined diff range expands and the target scaler range widens. Estimated impact on INT8 precision:
+
+| Training data | Approx. scaler range | INT8 step |
+|---|---|---|
+| SF only (current) | 28.45°C | 0.111°C/step |
+| PS only (estimated) | ~34°C | ~0.133°C/step |
+| SF + PS combined (estimated) | ~35–36°C | ~0.137–0.140°C/step |
+
+A combined SF+PS scaler would degrade INT8 output resolution by roughly 25%, pushing the achievable StdDev floor from ~0.111°C toward ~0.138°C — close to Model 5a's step size and erasing the precision advantage of the tighter SF-only scaler.
+
+**Mitigations to consider before adding PS data:**
+1. **Separate models per climate** — train a PS-specific model with its own scaler; keeps both models at their optimal INT8 precision
+2. **Climate-aware scaler clipping** — pad with a fixed worst-case ±2°C for the *expected deployment site* rather than the training extreme, accepting the small risk of out-of-range clipping for truly anomalous events
+3. **Evaluate whether combined training actually improves SF accuracy** — PS data may not generalize to SF and could hurt the SF model despite widening the scaler
+
+---
+
 This document tracks all experiments, changes, and results for Model 5b Conv2D.
 
 ## Baseline: Original Model 5b (Before Optimizations)
@@ -1468,19 +1542,23 @@ Quantized TFLite validation (500 samples):
 
 ## Comparison with Model 5a
 
-| Metric | Model 5a | Exp 17 | Exp 18 | Exp 19 | Exp 20 | Exp 21 | Exp 22 | Exp 23 | Exp 24 | Exp 25 (QAT) | Exp 26 | Exp 27 |
-|--------|----------|--------|--------|--------|--------|--------|--------|--------|--------|--------------|--------|--------|
-| val_loss | 0.000682 | 0.0039 | **0.0014** | 0.0015 ❌ | Cancelled | 0.0017 ❌ | 0.0020 ❌ | 0.0027 ❌ | **0.001343** ✅ | 0.0015 ❌ | 0.0039 ❌ | 0.0027 ❌ |
-| val_mae | 0.00445 | 0.0133 | 0.0060 | — | — | — | — | 0.0104 | **0.00605** | 0.0066 | 0.0121 ❌ | 0.013 avg |
-| Best epoch | 97 | 6 | 53 | 31 | — | 60 | 33 | ~early | 46 | **17** | **25** | **89** |
-| Model size (quant) | 788 KB | 221 KB | 395 KB | — | — | 587 KB | — | 395 KB | **307 KB** | 307 KB | 307 KB | **188 KB** |
-| Quantized MAE 1hr (°C) | — | 1.90 ❌ | 0.55 ❌ | not tested | — | not tested | — | 2.20 ❌ | 0.61 ❌ | **0.73 ❌** | 2.14 ❌ | **1.57 ⚠️** |
-| Top feature importance | temp_lag120 | **temperature ✅** | time_of_day_cos | — | — | — | time_of_day_cos | time_of_day_cos | time_of_day_sin2 | time_of_day_cos | **temp_lag60 ✅** | time_of_day_sin2 |
-| temperature rank | #1 | **#1 ✅** | 18th/19 | — | — | — | last | 18th/19 | 17th/19 | 17th/19 | 21st/21 ❌ | **#2 ✅** |
-| Architecture | Dense | Dual: main(64)+temp(32) | Dual: main(96)+temp(32) | Dual: main(96)+temp(64) | Dual: main(96)+temp(32) | Dual: main(96)+temp(32) + MSB | Dual: main(96)+temp(32) | Dual: main(96)+temp(32) | **Dual: main(64)+temp(64)** | QAT on Exp 24 | Dual: main(64)+temp(64) | **Conv2D+GAP** |
-| Input features | 19 | 19 | 19 | 19 | 19 | 19 | 19 | 19 | 19 | 19 | **21** | **21** |
-| Pre-computed lags | Yes | No | No | No | No | No | No | No | No | No | **Yes (lag60, lag120)** | **Yes (lag60, lag120)** |
-| Edge TPU viable (quant) | Yes | No ❌ | No ❌ | No ❌ | — | No ❌ | No ❌ | No ❌ | No ❌ | No ❌ | No ❌ | **Yes ✅** |
+| Metric | Model 5a | Exp 17 | Exp 18 | Exp 19 | Exp 20 | Exp 21 | Exp 22 | Exp 23 | Exp 24 | Exp 25 (QAT) | Exp 26 | Exp 27 | Exp 28 |
+|--------|----------|--------|--------|--------|--------|--------|--------|--------|--------|--------------|--------|--------|--------|
+| val_loss | 0.000682 | 0.0039 | **0.0014** | 0.0015 ❌ | Cancelled | 0.0017 ❌ | 0.0020 ❌ | 0.0027 ❌ | **0.001343** ✅ | 0.0015 ❌ | 0.0039 ❌ | 0.0027 ❌ | 0.0028 ❌ |
+| val_mae | 0.00445 | 0.0133 | 0.0060 | — | — | — | — | 0.0104 | **0.00605** | 0.0066 | 0.0121 ❌ | 0.013 avg | 0.0096 |
+| Best epoch | 97 | 6 | 53 | 31 | — | 60 | 33 | ~early | 46 | **17** | **25** | **89** | ~61 |
+| Model size (quant) | 788 KB | 221 KB | 395 KB | — | — | 587 KB | — | 395 KB | **307 KB** | 307 KB | 307 KB | **188 KB** | **193 KB** |
+| Quantized MAE 1hr (°C) | — | 1.90 ❌ | 0.55 ❌ | not tested | — | not tested | — | 2.20 ❌ | 0.61 ❌ | **0.73 ❌** | 2.14 ❌ | 1.57 ⚠️ | **1.12 ⚠️** |
+| Quantized MAE 2hr (°C) | — | — | — | — | — | — | — | — | — | — | — | 2.21 ❌ | **1.63 ⚠️** |
+| Quantized MAE 3hr (°C) | — | — | — | — | — | — | — | — | — | — | — | 2.63 ❌ | **2.01 ⚠️** |
+| Top feature importance | temp_lag120 | **temperature ✅** | time_of_day_cos | — | — | — | time_of_day_cos | time_of_day_cos | time_of_day_sin2 | time_of_day_cos | **temp_lag60 ✅** | time_of_day_sin2 | **temperature ✅** |
+| temperature rank | #1 | **#1 ✅** | 18th/19 | — | — | — | last | 18th/19 | 17th/19 | 17th/19 | 21st/21 ❌ | #2 ✅ | **#1 ✅** |
+| temp_lag60 rank | — | — | — | — | — | — | — | — | — | — | #1 ✅ | #19 ❌ | **#6 ✅** |
+| temp_lag120 rank | — | — | — | — | — | — | — | — | — | — | — | #18 ❌ | **#8 ✅** |
+| Architecture | Dense | Dual: main(64)+temp(32) | Dual: main(96)+temp(32) | Dual: main(96)+temp(64) | Dual: main(96)+temp(32) | Dual: main(96)+temp(32) + MSB | Dual: main(96)+temp(32) | Dual: main(96)+temp(32) | **Dual: main(64)+temp(64)** | QAT on Exp 24 | Dual: main(64)+temp(64) | **Conv2D+GAP** | **Conv2D+GAP+skip** |
+| Input features | 19 | 19 | 19 | 19 | 19 | 19 | 19 | 19 | 19 | 19 | **21** | **21** | **21** |
+| Pre-computed lags | Yes | No | No | No | No | No | No | No | No | No | **Yes (lag60, lag120)** | **Yes (lag60, lag120)** | **Yes (lag60, lag120)** |
+| Edge TPU viable (quant) | Yes | No ❌ | No ❌ | No ❌ | — | No ❌ | No ❌ | No ❌ | No ❌ | No ❌ | No ❌ | **Yes ✅** | **Yes ✅** |
 
 ---
 
@@ -1586,6 +1664,329 @@ All ops Edge TPU compatible: Slice/Gather on input tensor is a standard TFLite o
 - Quantized MAE improves on Exp 27: ≤ 1.0°C / 2.0°C / 2.5°C
 - Edge TPU viable (quantized outputs vary per sample)
 
+**Results**:
+- Best val_loss: **0.0028** — plateaued epochs 91–100 with no movement; still 4.1× short of Model 5a
+- Val MAE (float): diff_1hr: **0.01°C**, diff_2hr: **0.01°C**, diff_3hr: **0.02°C**
+- Val MAE (normalized): **0.0096** combined
+- Quantized model size: **193.26 KB**
+- Quantized MAE (TFLite INT8, 500 samples): diff_1hr: **1.12°C**, diff_2hr: **1.63°C**, diff_3hr: **2.01°C**
+- Training loss at epoch 100: ~3.53e-4; train/val gap: **~8×**
+- Converged fully: val_loss unchanged from epoch ~91 onward; cosine LR reached ~1e-6
+
+**Feature importance** (all 21 features, ranked):
+- **#1: `temperature`** (0.3450) ✅ — jumped from #2 (0.088 in Exp 27); skip connection gave it dominant gradient signal
+- **#2: `time_of_day_sin2`** (0.2247)
+- **#3: `time_of_day_cos`** (0.2150)
+- **#4: `time_of_day_sin`** (0.1290)
+- **#5: `time_of_day_cos2`** (0.1235)
+- **#6: `temp_lag60`** (0.1212) ✅ — up from #19 (0.063 in Exp 27); skip connection working
+- **#7: `uv`** (0.1096)
+- **#8: `temp_lag120`** (0.1016) ✅ — up from #18 (0.063 in Exp 27); skip connection working
+- #9: `solar_radiation` (0.1005), #10: `relative_humidity` (0.0911)
+- #11–21: illuminance, station_pressure, wind features, day_of_year, rain, temp_delta_1 (0.0869–0.0660)
+
+**Success criteria assessment**:
+- ⚠️ `temp_lag60` and `temp_lag120` in top 5: **missed** (#6 and #8), but dramatically improved from dead last (Exp 27: #18/#19); skip connection confirmed active
+- ❌ float val_loss ≤ 0.000682: **0.0028** — 4.1× short; float accuracy identical to Exp 27 despite better feature routing
+- ✅ Quantized MAE improves on Exp 27 (1.57/2.21/2.63): **1.12/1.63/2.01°C** — all three improved
+- ✅ Edge TPU viable: outputs vary per sample
+
+**Outcome**: ⚠️ **PARTIAL SUCCESS** — Skip connection fully resolved the GAP-dilution problem: temperature jumped to #1 importance (0.345 vs 0.088) and lag features moved from bottom-2 to top-10. Quantized accuracy improved on all three horizons vs Exp 27. However, float val_loss did not improve (0.0028 vs 0.0027) — the architecture correctly routes anchor features now, but the train/val gap (~8×) is structural and was not addressed. Float→quantized gap remains large (0.01°C float vs 1.12°C quantized).
+
+**Analysis**:
+- **Feature routing solved, accuracy wall unchanged**: The skip connection did exactly what it was designed to do — `temp_lag60`/`temp_lag120` are now exploited. Yet val_loss is identical to Exp 27. This suggests the GAP-dilution of lag features was not the primary bottleneck for float accuracy; the train/val generalization gap is.
+- **Train/val gap of 8×**: Training loss ~3.5e-4, val_loss ~0.0028. The model fits training sequences well but generalizes noisily to validation. This is a regularization/capacity problem, not a feature-routing problem.
+- **Float→quantized gap**: 0.01°C float vs 1.12°C quantized is ~100× degradation. INT8 rounding accumulates across 4 Conv2D blocks + dense head. Per-channel quantization or QAT could reduce this, but quantization is Phase 2.
+- **Path forward**: The float accuracy ceiling (~0.0027–0.0028) has been hit by two consecutive Conv2D experiments with different architectures. To close the remaining 4× gap to Model 5a, the next lever is the train/val generalization gap — stronger regularization (higher dropout, L2), data augmentation, or a fundamentally different approach to reducing overfitting.
+
 ---
 
-*Last updated: 2026-05-01*
+## Experiment 29: Slope Features in Skip Path + Input Tensor
+
+**Date**: 2026-05-04
+**Goal**: Close the remaining 4× float accuracy gap to Model 5a (0.000682) by adding explicit rolling-regression slope features — the single change responsible for Model 5a's 15× improvement over Model 5. Exp 28 proved the skip path correctly routes single-timestep anchor values; Exp 29 uses the same mechanism to deliver explicit trend signals that the Conv2D blocks are currently trying (and failing) to learn implicitly.
+
+**Root cause of Exp 28 accuracy wall**:
+The Conv2D path uses kernels of size 3, 7, and 15 timesteps to capture temporal trends, but those learned representations are (a) averaged away by GlobalAveragePooling2D and (b) shared across all 21 features with no temperature-specific gradient. The 8× train/val gap indicates the model is overfitting to implicit trend patterns in training data rather than learning stable, generalizable signals. Model 5a's breakthrough was replacing 1-step raw deltas with Numba-computed linear-regression slopes over 15–60 sample windows — stable, low-noise trend signals that generalize well.
+
+**Changes from Exp 28**:
+1. **Pre-compute 6 slope features** using the Numba rolling-regression function already in the script (currently commented out at lines 333–360), applied to both train and val data:
+   - `temp_slope_15` — temperature slope over 15-minute window
+   - `temp_slope_30` — temperature slope over 30-minute window
+   - `temp_slope_60` — temperature slope over 60-minute window
+   - `solar_slope_30` — solar radiation slope over 30-minute window
+   - `humidity_slope_30` — relative humidity slope over 30-minute window
+   - `pressure_slope_60` — station pressure slope over 60-minute window
+2. **Add all 6 slope features to the input tensor** (n_features: 21 → 27) so the Conv2D path sees them for temporal context
+3. **Expand the skip/anchor path** to extract t=0 values for all 9 anchor features (temp, lag60, lag120 + 6 slopes); expand anchor Dense from 16 → 32 units to accommodate the wider input
+4. Retain all other Exp 28 settings: cosine decay LR (1e-4 → 1e-6 over 100 epochs), same Conv2D block structure (FILTERS=64, kernels 3/7/15/feat), BatchNorm + ReLU6, batch size 512, 3-output head
+
+**Architecture**:
+```
+Input: (180, 27) → Reshape to (180, 27, 1)
+  ├─ Conv2D path:  [Conv2D(64,k=3)→BN→ReLU6 → Conv2D(64,k=7)→BN→ReLU6
+  │                 → Conv2D(64,k=15)→BN→ReLU6 → Conv2D(64,k=27)→BN→ReLU6]
+  │                → GAP → Dense(64) → ReLU6 → context
+  └─ Skip path:   input[:, -1, [temp, lag60, lag120,
+                                temp_slope_15, temp_slope_30, temp_slope_60,
+                                solar_slope_30, humidity_slope_30, pressure_slope_60]]
+                  → Dense(32) → ReLU6 → anchors
+Concatenate([context(64), anchors(32)])  →  Dense(32) → ReLU6 → Dense(3) outputs
+```
+
+**Training config**:
+- Learning rate: cosine decay from 1e-4 → 1e-6 over 100 epochs (same as Exp 28)
+- Loss: MSE (per-head)
+- Batch size: 512
+- Early stopping: patience=25
+- Epochs: 100
+
+**Success criteria**:
+- `temp_slope_60`, `temp_slope_30`, or `temp_slope_15` appear in top 5 feature importance (confirming explicit slopes are actively used)
+- float val_loss ≤ 0.001343 (beat the all-time Conv best from Exp 24)
+- Ideally float val_loss approaches 0.000682 (Model 5a parity)
+- Quantized MAE maintains or improves on Exp 28 (≤ 1.12°C / 1.63°C / 2.01°C)
+- Edge TPU viable (quantized outputs vary per sample)
+
+**Intermediate results (epochs 81–84, 2026-05-06)**:
+
+| Epoch | train_loss | val_loss | val_1hr_mae | val_2hr_mae | val_3hr_mae | LR |
+|-------|------------|----------|-------------|-------------|-------------|-----|
+| 81 | 2.6457e-04 | 0.0028 | 0.0154 | 0.0159 | 0.0210 | 1.05e-5 |
+| 82 | 2.6372e-04 | 0.0027 | 0.0153 | 0.0155 | 0.0182 | 9.56e-6 |
+| 83 | 2.6385e-04 | 0.0026 | 0.0154 | 0.0157 | 0.0172 | 8.71e-6 |
+| 84 | 2.5856e-04 | 0.0026 | 0.0154 | 0.0160 | 0.0172 | 7.89e-6 |
+
+**Results (final, epoch 101, 2026-05-07)**:
+- Best val_loss: **0.0026** — best epoch was 15; cosine LR reached ~1e-6 at epoch 100 with no further improvement
+- Val MAE (float): diff_1hr: **0.01°C**, diff_2hr: **0.01°C**, diff_3hr: **0.02°C**
+- Val MAE (normalized): **0.0084** combined
+- Final train_loss: 2.4413e-04; train/val gap: **~10×**
+- Quantized model size: **218.20 KB**
+- Quantized MAE (TFLite INT8, 500 samples): diff_1hr: **0.82°C**, diff_2hr: **1.49°C**, diff_3hr: **1.63°C**
+
+**Feature importance** (all 27 features, ranked):
+- **#1: `time_of_day_sin2`** (0.1376)
+- **#2: `time_of_day_cos`** (0.1154)
+- **#3: `temp_lag60`** (0.1115) ✅ skip path working
+- **#4: `uv`** (0.0982)
+- **#5: `illuminance`** (0.0947)
+- **#6: `temperature`** (0.0822) — dropped from #1 (0.345) in Exp 28; diluted by slope features
+- **#7: `time_of_day_sin`** (0.0803)
+- **#8: `wind_gust`** (0.0798)
+- **#9: `relative_humidity`** (0.0783), **#10: `station_pressure`** (0.0779)
+- **#11: `temp_lag120`** (0.0774), **#12: `temp_slope_60`** (0.0773), **#13: `solar_radiation`** (0.0770)
+- **#14: `wind_direction_sin`** (0.0767), **#15: `wind_lull`** (0.0755)
+- **#16–22**: `day_of_year_cos` (0.0749), `rain_accumulated` (0.0746), `day_of_year_sin` (0.0746), `humidity_slope_30` (0.0745), `solar_slope_30` (0.0743), `wind_direction_cos` (0.0739), `pressure_slope_60` (0.0734)
+- **#23–26**: `temp_delta_1` (0.0727), `wind_avg` (0.0720), `temp_slope_30` (0.0715), `temp_slope_15` (0.0707)
+- **#27: `time_of_day_cos2`** (0.0550)
+
+**Success criteria assessment**:
+- ❌ Slope features in top 5: `temp_slope_60` is #12 (0.077); all six slopes rank 12th–26th
+- ❌ float val_loss ≤ 0.001343: **0.0026** — 1.9× short of Exp 24's Conv best; 3.8× short of Model 5a
+- ✅ Quantized MAE ≤ Exp 28 thresholds (1.12/1.63/2.01): **0.82/1.49/1.63°C** — all three improved
+- ⚠️ Edge TPU viable: diff_3hr outputs near-constant (-0.133 to -0.127) on 500 validation samples
+
+**Outcome**: ⚠️ **PARTIAL SUCCESS** — Quantization improved on all three horizons vs Exp 28, and float accuracy improved marginally (0.0026 vs 0.0028). However, slope features did not land in the top 5 and did not break the float accuracy wall. The `temperature` feature importance collapsed from #1 (0.345 in Exp 28) to #6 (0.082) — the expanded skip-path anchor set and additional Conv2D feature channels are crowding out the raw temperature gradient that drove Exp 28's strongest signal.
+
+**Analysis**:
+- **Slopes are used, but not dominant**: All six slope features rank in the lower half of the 27-feature set (~0.07–0.08 importance each). The model uses them but treats them as weak corroborating signals rather than primary predictors. This contrasts with Model 5a where slope features were decisive.
+- **Time-of-day still dominates**: `time_of_day_sin2` (#1, 0.138) and `time_of_day_cos` (#2, 0.115) lead the ranking. The diurnal signal is the strongest generalizable pattern in the validation set, which the model correctly exploits but which limits actual temperature-change accuracy.
+- **Overfitting worsened**: Train/val gap widened from ~8× (Exp 28) to ~10× (Exp 29). Adding 6 features increased effective capacity without improving generalization. Best epoch at 15 confirms the model overfits almost immediately and the remaining 85 epochs only recover marginally.
+- **`temperature` signal diluted**: In Exp 28, routing just three anchor features (temp, lag60, lag120) through the skip Dense(16) gave `temperature` a dominant gradient. In Exp 29, nine features compete through Dense(32), and the six new slope features introduce correlated temperature-trend signals that split the gradient, reducing each feature's individual importance score.
+- **Path forward**: The float accuracy ceiling (~0.0026) has now been confirmed across three consecutive Conv2D experiments (Exp 27–29). The primary bottleneck is the ~10× train/val generalization gap, not feature engineering. The next lever must be regularization: L2 weight decay, higher dropout, or reduced filter count to force better generalization. Adding more features has now been tried twice (Exp 26 added lags, Exp 29 added slopes) without breaking the wall.
+
+---
+
+## Experiment 30: Dropout(0.3) Regularization on Context Vector
+
+**Date**: 2026-05-07
+**Goal**: Break the ~10× train/val generalization gap that has persisted across Exp 27–29 by adding explicit dropout regularization to the Conv2D temporal path.
+
+**Root cause of the Exp 27–29 accuracy wall**:
+Three consecutive Conv2D experiments have plateaued at val_loss ~0.0026–0.0028 with train loss ~2.5–2.6e-4 — a 10× gap. Feature engineering (lag features in Exp 26, slope features in Exp 29) improved quantized MAE marginally but did not move the float ceiling. The bottleneck is overfitting, not insufficient features. Exp 29's best epoch was epoch 15 of 100; the remaining 85 epochs provide no generalization improvement.
+
+**Key insight from Model 5a**:
+Model 5a (val_loss=0.000682) uses `Dropout(0.3)` after its first Dense(128) layer and achieves a train/val gap of ~2× rather than 10×. It achieves this **without** slope features — just lag features, the flatten→Dense architecture, and dropout. Dropout is the single largest architectural difference between Model 5a and the current Conv2D stack.
+
+**Change from Exp 29**:
+Add a single `Dropout(0.3)` layer after `relu_context` (the Dense(64) + ReLU6 temporal representation, before the Concatenate with the anchor path). This is the direct equivalent of Model 5a's dropout placement — applied to the richest intermediate representation before the final prediction head.
+
+```
+# Before (Exp 29):
+GAP → Dense(64) → ReLU6 → context
+# After (Exp 30):
+GAP → Dense(64) → ReLU6 → Dropout(0.3) → context
+```
+
+All other settings unchanged from Exp 29: slope features (n_features=27), anchor path with 9 features → Dense(32) → ReLU6, cosine LR decay (1e-4 → 1e-6 over 100 epochs), batch size 512, patience=25.
+
+**Architecture**:
+```
+Input: (180, 27) → Reshape to (180, 27, 1)
+  ├─ Conv2D path:  [Conv2D(64,k=3)→BN→ReLU6 → Conv2D(64,k=7)→BN→ReLU6
+  │                 → Conv2D(64,k=15)→BN→ReLU6 → Conv2D(64,k=27)→BN→ReLU6]
+  │                → GAP → Dense(64) → ReLU6 → Dropout(0.3) → context  ← NEW
+  └─ Skip path:   input[:, -1, [temp, lag60, lag120,
+                                temp_slope_15, temp_slope_30, temp_slope_60,
+                                solar_slope_30, humidity_slope_30, pressure_slope_60]]
+                  → Dense(32) → ReLU6 → anchors
+Concatenate([context(64), anchors(32)])  →  Dense(32) → ReLU6 → Dense(3) outputs
+```
+
+**Hypothesis**: Dropout forces the 64 context neurons to learn redundant representations, preventing individual neurons from memorising training-set-specific patterns. This should:
+1. Close the train/val gap from ~10× toward ~2–3×
+2. Push val_loss below the 0.001343 threshold (Exp 24 Conv best) and toward the 0.000682 Model 5a target
+3. Potentially delay the best epoch from epoch 15 to a later epoch where the model has learned more robust representations
+
+**Training config**:
+- Learning rate: cosine decay from 1e-4 → 1e-6 over 100 epochs (unchanged)
+- Loss: MSE (per-head, unchanged)
+- Batch size: 512 (unchanged)
+- Early stopping: patience=25 (unchanged)
+- Epochs: 100
+
+**Success criteria**:
+- Train/val gap narrows from ~10× to ≤ 3× (primary signal that dropout is working)
+- float val_loss ≤ 0.001343 (beat all-time Conv best from Exp 24)
+- Ideally float val_loss approaches 0.000682 (Model 5a parity)
+- Best epoch shifts later than epoch 15 (confirms regularization is taking effect)
+
+**Results (final, epoch 101, 2026-05-10)**:
+- Best val_loss: **0.0032** — best epoch was **3**; dropout did not delay convergence, model peaked even earlier than Exp 29
+- Val MAE (float): diff_1hr: **0.01°C**, diff_2hr: **0.02°C**, diff_3hr: **0.02°C**
+- Val MAE (normalized combined): **0.0108**
+- Final train_loss: 7.8044e-04 (elevated by dropout during training); train/val gap: **~4.1×**
+- Quantized model size: **218.20 KB**
+- Quantized MAE (TFLite INT8, 500 samples): diff_1hr: **0.67°C**, diff_2hr: **1.39°C**, diff_3hr: **1.71°C**
+
+**Feature importance** (all 27 features, ranked):
+- **#1: `time_of_day_sin2`** (0.1011)
+- **#2: `time_of_day_sin`** (0.0882)
+- **#3: `solar_radiation`** (0.0824)
+- **#4: `time_of_day_cos2`** (0.0738), **#5: `temp_lag120`** (0.0738) ✅ skip path working
+- **#6: `time_of_day_cos`** (0.0727), **#7: `uv`** (0.0711)
+- **#8: `solar_slope_30`** (0.0679), **#9: `illuminance`** (0.0673)
+- **#10–15**: `wind_direction_sin` (0.0660), `wind_avg` (0.0656), `humidity_slope_30` (0.0655), `temp_slope_60` (0.0649), `wind_gust` (0.0634), `wind_direction_cos` (0.0634)
+- **#16–21**: `temp_lag60` (0.0632), `station_pressure` (0.0619), `rain_accumulated` (0.0614), `day_of_year_sin` (0.0614), `temp_slope_30` (0.0613), `wind_lull` (0.0613)
+- **#22–26**: `day_of_year_cos` (0.0612), `temp_delta_1` (0.0612), `pressure_slope_60` (0.0610), `relative_humidity` (0.0605), `temp_slope_15` (0.0594)
+- **#27: `temperature`** (0.0563)
+
+**Edge TPU compilation**:
+- Compiled successfully; 14/15 ops on Edge TPU, 1 op (GATHER) on CPU
+- 2 Edge TPU subgraphs; quantized size: 218.20 KB → 309.37 KB (compiled)
+- On-chip memory: 229.75 KB used, 6.61 MB remaining
+
+**Success criteria assessment**:
+- ⚠️ Train/val gap ≤ 3×: gap narrowed to **~4.1×** (from ~10×) — meaningful improvement but short of target; note train loss is inflated by dropout during training
+- ❌ float val_loss ≤ 0.001343: **0.0032** — regressed vs Exp 29 (0.0026); absolute accuracy got worse
+- ❌ float val_loss approaches 0.000682: **0.0032** — 4.7× away from Model 5a parity
+- ❌ Best epoch later than 15: **epoch 3** — peaked even earlier than Exp 29's epoch 15
+
+**Outcome**: ❌ **REGRESSION** — Dropout(0.3) reduced the train/val ratio gap (~10× → ~4.1×) but absolute val_loss regressed from 0.0026 to 0.0032. Best epoch at 3 is the earliest seen across all Conv2D experiments, suggesting the dropout rate is too aggressive: the model is underfitting rather than just being regularized. Quantized 1hr and 2hr MAE improved slightly (0.67°C / 1.39°C vs 0.82°C / 1.49°C) but 3hr regressed (1.71°C vs 1.63°C). Feature importance is extremely flat — all 27 features cluster between 0.056–0.101, compared to Exp 29's wider spread. Time-of-day features dominate (#1–#4) while `temperature` collapsed to last place (#27, 0.056), suggesting the skip path's anchor gradient is being overwhelmed by the regularized context path.
+
+**Analysis**:
+- **Dropout narrowed the ratio gap but hurt absolute val_loss**: The train/val ratio fell from ~10× to ~4.1×, but this is partly because dropout inflates training loss, making the ratio look better than it is. The true signal is that val_loss got worse (0.0032 vs 0.0026), meaning the model is now underfitting — Dropout(0.3) is too strong for a 64-unit context vector.
+- **Best epoch at 3 is a regression signal**: Across Exp 27 (epoch 3), Exp 28 (not stated), Exp 29 (epoch 15), Exp 30 (epoch 3). Dropout did not delay the best epoch — it collapsed it. The model is learning its best representations in the first few epochs and then degrading, which is consistent with underfitting rather than regularization.
+- **Feature importance compression**: All 27 features now score between 0.056–0.101. Dropout on the context path forces the model to spread gradient across all features uniformly (each context neuron gets randomly masked), effectively averaging out feature-specific signals. The anchor path (skip connection) is not regularized and should retain specificity, but `temperature` at #27 (0.056) suggests the concat head is dominated by the (now noisy) context path.
+- **Path forward**: Dropout(0.3) is too aggressive. Options: (a) reduce dropout rate to 0.1–0.15 and try again; (b) try L2 weight decay instead of dropout on the context Dense(64); (c) apply dropout to the final Dense(32) head instead of the context vector; (d) accept the ~0.0026 float ceiling and focus on improving quantized accuracy through QAT or output-head calibration.
+
+---
+
+## Experiment 31: Dropout(0.1) — Lighter Regularization on Context Vector
+
+**Date**: 2026-05-10
+**Goal**: Find the correct dropout rate for the context vector by stepping down from the over-aggressive Dropout(0.3) used in Exp 30. Exp 30 confirmed dropout is the right tool (train/val gap narrowed from ~10× to ~4.1×) but the rate was too high — best epoch collapsed to 3 and val_loss regressed from 0.0026 to 0.0032.
+
+**Root cause of Exp 30 regression**:
+Dropout(0.3) randomly silences 30% of the 64 context neurons per step. For a 64-unit vector this is ~19 neurons masked per batch, forcing the remaining ~45 to cover the entire temporal representation. The model cannot maintain feature-specific gradients at that noise level — all 27 features compressed into a flat 0.056–0.101 importance band, `temperature` fell to dead last (#27), and the model peaked at epoch 3 (earlier than even Exp 29's epoch 15). Dropout(0.3) is too wide a filter.
+
+**Change from Exp 30**:
+Reduce `Dropout(0.3)` → `Dropout(0.1)` on the context vector. Everything else is identical to Exp 30 (and Exp 29 before it).
+
+```
+# Before (Exp 30):
+GAP → Dense(64) → ReLU6 → Dropout(0.3) → context
+# After (Exp 31):
+GAP → Dense(64) → ReLU6 → Dropout(0.1) → context
+```
+
+Dropout(0.1) masks only ~6–7 of the 64 context neurons per step — enough to prevent individual neurons from memorising training-set patterns, but light enough to preserve the gradient signal that keeps feature importances differentiated.
+
+**Architecture** (identical to Exp 30 except dropout rate):
+```
+Input: (180, 27) → Reshape to (180, 27, 1)
+  ├─ Conv2D path:  [Conv2D(64,k=3)→BN→ReLU6 → Conv2D(64,k=7)→BN→ReLU6
+  │                 → Conv2D(64,k=15)→BN→ReLU6 → Conv2D(64,k=27)→BN→ReLU6]
+  │                → GAP → Dense(64) → ReLU6 → Dropout(0.1) → context  ← CHANGED
+  └─ Skip path:   input[:, -1, [temp, lag60, lag120,
+                                temp_slope_15, temp_slope_30, temp_slope_60,
+                                solar_slope_30, humidity_slope_30, pressure_slope_60]]
+                  → Dense(32) → ReLU6 → anchors
+Concatenate([context(64), anchors(32)])  →  Dense(32) → ReLU6 → Dense(3) outputs
+```
+
+**Training config** (unchanged from Exp 29/30):
+- Learning rate: cosine decay from 1e-4 → 1e-6 over 100 epochs
+- Loss: MSE (per-head)
+- Batch size: 512
+- Early stopping: patience=25
+- Epochs: 100
+
+**Success criteria**:
+- float val_loss ≤ 0.0026 (beat Exp 29; Exp 30 regressed to 0.0032)
+- Train/val gap ≤ 4× (vs ~4.1× in Exp 30, ~10× in Exp 29 — need real val_loss improvement, not just ratio)
+- Best epoch later than epoch 3 (confirms lighter dropout preserves the learning trajectory)
+- Feature importance spread wider than Exp 30's flat 0.056–0.101 band (confirms context gradient is preserved)
+
+---
+
+## Infrastructure: macOS Training Hang — Root Cause and Fix
+
+**Date**: 2026-05-12
+
+### Problem
+
+Training hangs indefinitely when the Mac is in active use (browsing, typing, etc.), but runs cleanly when left idle. The hang is always in the same place:
+
+```
+ProcessFunctionLibraryRuntime::RunSync
+  → absl::Notification::WaitForNotification()
+    → pthread_cond_wait  (blocked forever)
+```
+
+`RunSync` dispatches a compiled `tf.function` to the Metal GPU asynchronously and waits for a completion notification that never arrives.
+
+### Root Cause
+
+**`steps_per_execution=20` sustains ~90% GPU utilisation, leaving Metal no idle time to serve the display without preempting TF.**
+
+With `steps_per_execution=20`, each `RunSync` call bundles 20 mini-batches into a single Python→GPU dispatch. The GPU runs continuously for the full duration (~27 s at the time of the last recorded hang) with no opportunity for Metal's scheduler to service WindowServer (the display compositor) between mini-batches. When the Mac is in interactive use, Metal must preempt TF's in-flight compute shader. Under CUDA/Linux, NVIDIA guarantees forward progress after preemption. Metal's guarantee is weaker — under sustained display pressure a preempted command buffer can be delayed indefinitely. TF's `absl::Notification` wait has no timeout, so the main thread blocks forever.
+
+**What the earlier non-hanging experiments had in common**: the Conv1D experiments ran with `mixed_float16` precision enabled. On Apple Silicon's Metal backend, not all ops have float16 kernels, so TF silently falls back to CPU float32 for some operations. Those CPU fallbacks naturally broke up sustained GPU usage — the GPU got implicit breathing room between Metal dispatches. When mixed precision was disabled (Exp 22, for unrelated LR scheduling reasons — see that entry), all ops moved to the GPU in float32 with no CPU interleaving, which is what drove utilisation to ~90% and made the hangs appear.
+
+**Attempted fix that did not work**: a `GPUThrottleCallback` that slept between `on_train_batch_end` calls. With `steps_per_execution=20`, `on_train_batch_end` fires *after* each 20-batch `RunSync` completes. Sleeping there gives Metal gaps between dispatches, but the hang occurs *within* a single dispatch — so the sleep was never reachable when a hang was in progress.
+
+### Fix
+
+**Set `steps_per_execution=1`.** Each `RunSync` call now covers exactly one mini-batch, then control returns to Python. The Python-side callback overhead between successive `RunSync` calls acts as the scheduling gap that Metal needs to service display requests without preempting TF — functionally the same role the CPU-op fallbacks played when mixed precision was enabled, but without re-enabling mixed precision (which breaks LR scheduling).
+
+```python
+# Before (sustained GPU, hangs during interactive use):
+steps_per_execution=20
+
+# After (natural Python gaps between every mini-batch):
+steps_per_execution=1
+```
+
+The overhead cost is negligible: epoch time is ~940 s, so even if Python overhead per batch is 5–10 ms, across ~1450 batches that is 7–15 s — under 2% of epoch time.
+
+Mixed precision remains disabled. Re-enabling it would fix the GPU utilisation problem via CPU fallbacks, but silently breaks the LR scheduler (Adam gets wrapped in `LossScaleOptimizer`; LR assignments target the inner optimizer and are silently ignored).
+
+### Last hang recorded
+
+Epoch 85, batch 940/1147 (82%), stuck for 30 minutes (written to `training_hang_detected.json`). Average batch time at hang: 27.5 s per `steps_per_execution=20` group — already elevated, indicating Metal was already struggling before the full stall.
+
+---
+
+*Last updated: 2026-05-12*
