@@ -11,12 +11,13 @@ import tflite_runtime.interpreter as tflite
 import sys
 import atexit
 import pprint
+import argparse
 
 # --- Configuration ---
 MODEL_PATH = "weather_model_5a_best_edgetpu.tflite"
 SEQ_LEN = 180  # Sequence length matching training (3 hours of history)
 BATCH_SIZE = 50000
-QUERY_BATCH_SIZE = 100000
+QUERY_BATCH_SIZE = 80000  # InfluxDB server max-select-points limit is 100k; effective window = this + 2*SEQ_LEN(360) + EXTRA_SAMPLES(250)
 EXTRA_SAMPLES = 250  # Extra buffer beyond sequence and furthest target
 # FEATURE_COUNT will be determined dynamically based on available features
 # Base: 24 features + optional wind_direction (2), wind_lull (1), rain_accumulated (1)
@@ -33,35 +34,64 @@ FEATURE_ORDER_BASE = [
 
 # --- Functions ---
 
-def predict_on_window(window, interpreter, input_index, output_index):
+def _exit_restart_for_wrapper():
+    """Tell run_with_restart.py to launch another batch (exit 88).
+
+    Use os._exit instead of sys.exit: after a long Edge TPU run, interpreter
+    shutdown can segfault in native delegate teardown (parent would see -11).
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(88)
+
+
+def _build_delegate_options(tpu_arg: str):
+    """Return EdgeTPU delegate options for an optional TPU selector."""
+    if not tpu_arg:
+        return None
+
+    tpu_arg = str(tpu_arg).strip()
+    if not tpu_arg:
+        return None
+
+    # Accept either explicit forms (usb:0, pci:1, :0) or plain numeric ids (0, 1, ...).
+    if ":" in tpu_arg:
+        device = tpu_arg
+    else:
+        device = f":{tpu_arg}"
+    return {"device": device}
+
+
+def _extract_interpreter_constants(interp_input_details, interp_output_details):
+    """Pre-extract all constant values from interpreter details to avoid per-call dict lookups."""
+    idx = interp_input_details[0]['index']
+    i_scale, i_zp = interp_input_details[0]['quantization']
+    o_indices = [interp_output_details[k]['index'] for k in range(3)]
+    o_scales   = [interp_output_details[k]['quantization'][0] for k in range(3)]
+    o_zps      = [interp_output_details[k]['quantization'][1] for k in range(3)]
+    return idx, i_scale, i_zp, o_indices, o_scales, o_zps
+
+
+def predict_on_window(window, interpreter, input_index, input_scale, input_zero_point,
+                      output_indices, output_scales, output_zero_points, input_buffer):
     start = time.perf_counter()
-    # window should be shape (SEQ_LEN, FEATURE_COUNT)
-    window_features = window[:, :FEATURE_COUNT]
-    input_scale, input_zero_point = input_details[0]['quantization']
-    # Reshape to (1, SEQ_LEN, FEATURE_COUNT) for batch inference
-    input_tensor = np.clip(np.round(window_features / input_scale + input_zero_point), -128, 127).astype(np.int8).reshape(1, SEQ_LEN, FEATURE_COUNT)
-    interpreter.set_tensor(input_index, input_tensor)
+    # window is already float32 and clipped to [0,1] by the pre-normalization step.
+    # Quantize directly into the pre-allocated int8 buffer — no intermediate allocations.
+    np.clip(
+        np.round(window / input_scale + input_zero_point),
+        -128, 127,
+        out=input_buffer[0],
+    )
+    interpreter.set_tensor(input_index, input_buffer)
     interpreter.invoke()
-    # print("🔎 Output Tensors:")
-    # for i in range(3):
-        # tensor = interpreter.get_tensor(output_details[i]['index'])
-        # scale, zero_point = output_details[i]['quantization']
-        # print(f"Output {i} (raw): {tensor[0][0]}, scale: {scale}, zero_point: {zero_point}")
-        # dequant = (tensor[0][0] - zero_point) * scale
-        # print(f"Output {i} (dequantized): {dequant}")
-    outputs = []
-    for i in range(3):
-        tensor = interpreter.get_tensor(output_details[i]['index'])
-        q_value = tensor[0][0]
-        scale, zero_point = output_details[i]['quantization']
-        dequant = (q_value - zero_point) * scale
-        outputs.append(dequant)
 
-    output = np.array(outputs, dtype=np.float32)
-    # Rescale model output from normalized [-1, 1] to real temperature using correct inverse scaling
-    output = np.clip(output, -1.0, 1.0)
-    output_rescaled = 0.5 * (output + 1.0) * (y_max - y_min) + y_min
+    # Dequantize all 3 outputs using pre-extracted constants (no dict lookups).
+    output_scaled = np.array([
+        (interpreter.get_tensor(output_indices[k])[0][0] - output_zero_points[k]) * output_scales[k]
+        for k in range(3)
+    ], dtype=np.float32)
 
+    output_rescaled = 0.5 * (output_scaled + 1.0) * (y_max - y_min) + y_min
     inference_time_ms = (time.perf_counter() - start) * 1000
     return output_rescaled, inference_time_ms
 
@@ -73,18 +103,19 @@ def create_influx_points(base_timestamp, actuals, preds, current_temp, temp_lag3
     pred_2hr_temp = float(preds[1]) + float(current_temp)
     pred_3hr_temp = float(preds[2]) + float(current_temp)
 
+    # actuals is a numpy array [temp_t+1hr, temp_t+2hr, temp_t+3hr]
     horizons = [
-        (1, pred_1hr_temp, 'temp_t+1hr'),
-        (2, pred_2hr_temp, 'temp_t+2hr'),
-        (3, pred_3hr_temp, 'temp_t+3hr'),
+        (1, pred_1hr_temp, 0),
+        (2, pred_2hr_temp, 1),
+        (3, pred_3hr_temp, 2),
     ]
 
     points = []
-    for hrs, pred_temp, actual_key in horizons:
+    for hrs, pred_temp, actual_idx in horizons:
         future_ts = base_timestamp + pd.Timedelta(hours=hrs)
         fields = {f"pred_{hrs}hr_temperature": pred_temp}
-        if actuals is not None and not pd.isna(actuals[actual_key]):
-            fields[f"actual_{hrs}hr_temperature"] = float(actuals[actual_key])
+        if actuals is not None and not np.isnan(actuals[actual_idx]):
+            fields[f"actual_{hrs}hr_temperature"] = float(actuals[actual_idx])
         points.append({
             "measurement": "model_5a",
             "time": future_ts.isoformat(),
@@ -93,6 +124,14 @@ def create_influx_points(base_timestamp, actuals, preds, current_temp, temp_lag3
     return points
 
 # --- Load Scaler Parameters ---
+parser = argparse.ArgumentParser(description="Run Model 5 inference and write results to InfluxDB.")
+parser.add_argument(
+    "--tpu",
+    default="",
+    help="EdgeTPU device selector (examples: 0, :0, usb:0, pci:0).",
+)
+args = parser.parse_args()
+
 print("Loading input scaler...")
 with open("input_scaler_5a.json", "r") as f:
     input_scaler = json.load(f)
@@ -126,18 +165,23 @@ writer_client = InfluxDBClient(
 
 # --- Load Model ---
 print("Loading TFLite model with EdgeTPU delegate...")
+delegate_options = _build_delegate_options(args.tpu)
+if delegate_options:
+    print(f"Using EdgeTPU device: {delegate_options['device']}")
+    edgetpu_delegate = tflite.load_delegate('libedgetpu.so.1', delegate_options)
+else:
+    edgetpu_delegate = tflite.load_delegate('libedgetpu.so.1')
+
 interpreter = tflite.Interpreter(
     model_path=MODEL_PATH,
-    experimental_delegates=[tflite.load_delegate('libedgetpu.so.1')]
+    experimental_delegates=[edgetpu_delegate]
 )
 interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 
-input_index = input_details[0]['index']
-output_index = output_details[0]['index']
-output_scale = output_details[0]['quantization'][0]
-output_zero_point = int(output_details[0]['quantization'][1])
+input_index, input_scale, input_zero_point, output_indices, output_scales, output_zero_points = \
+    _extract_interpreter_constants(input_details, output_details)
 
 # --- Determine Resume Point from InfluxDB ---
 print("Checking InfluxDB for last prediction timestamp...")
@@ -306,10 +350,40 @@ if len(float_cols) > 0:
 print("✅ Total rows after dropping NaNs:", len(df))
 print(f"📊 Data range: {df.index.min()} to {df.index.max()}")
 
+# Pre-normalize the entire feature matrix once — avoids per-row Python loop inside the inference loop
+_f_mins = np.array([float(input_scaler[f]["min"]) for f in FEATURE_ORDER], dtype=np.float32)
+_f_maxs = np.array([float(input_scaler[f]["max"]) for f in FEATURE_ORDER], dtype=np.float32)
+_f_denoms = _f_maxs - _f_mins
+_f_denoms[_f_denoms == 0.0] = 1.0  # avoid div-by-zero; those columns will be 0 after subtraction
+_zero_cols = (_f_maxs - _f_mins) == 0.0
+
+scaled_data = np.clip(
+    (df[FEATURE_ORDER].values.astype(np.float32) - _f_mins) / _f_denoms,
+    0.0, 1.0
+)
+scaled_data[:, _zero_cols] = 0.0
+
+# Pre-extract per-row arrays to avoid pandas .iloc overhead in the inference loop
+targets_arr = df[['temp_t+1hr', 'temp_t+2hr', 'temp_t+3hr']].values.astype(np.float32)
+temperatures = df['temperature'].values.astype(np.float32)
+temp_lag30_arr = df['temp_lag30'].values.astype(np.float32)
+timestamps = df.index
+
+# Pre-allocate the INT8 input buffer once; reused every call to avoid per-prediction allocation.
+input_buffer = np.empty((1, SEQ_LEN, FEATURE_COUNT), dtype=np.int8)
+
 # Normalize and run inference
 print("Running inference...")
-inference_times = []
+# Running stats replace a growing list — O(1) update, no full-list scan at flush time.
+run_count = 0
+run_sum = 0.0
+run_min = float('inf')
+run_max = float('-inf')
 prediction_points = []
+
+# Integer thresholds avoid float division in the hot loop.
+WRITE_EVERY   = BATCH_SIZE // 4   # flush to InfluxDB every N predictions
+RESTART_EVERY = 500_000           # full process restart every N predictions
 
 start_index = 0
 if last_ts:
@@ -319,82 +393,81 @@ if last_ts:
         backfill_from = last_input_ts - pd.Timedelta(minutes=SEQ_LEN)
         start_index = df.index.searchsorted(backfill_from)
     except Exception:
+        print(f"⚠️  Could not locate backfill position for {last_ts}, starting from beginning")
         start_index = 0
 
-resume_time = df.index[start_index] if start_index < len(df) else "N/A"
 min_start = max(start_index, SEQ_LEN - 1)
+
+# Clamp min_start to valid range - ensure we can actually make predictions
+if min_start >= len(df):
+    print(f"⚠️  No new data to process (calculated start_index={start_index}, min_start={min_start}, df length={len(df)})")
+    print(f"    All predictions are up to date!")
+    min_start = len(df)  # Set to len(df) so the loop won't execute
+    resume_time = "N/A"
+else:
+    resume_time = df.index[min_start] if min_start < len(df) else "N/A"
+
 print(f"🔁 Resuming from index {min_start} / {len(df) - 1} at {resume_time} (backfilling 3 hrs of actuals)")
 print(f"📊 Using sequence length of {SEQ_LEN} timesteps (3 hours of history)")
 
 for i in range(min_start, len(df)):
-    # Build sequence: use timesteps from i-SEQ_LEN+1 to i (inclusive) = SEQ_LEN timesteps
-    # This gives us the most recent SEQ_LEN timesteps ending at index i
     window_start = i - SEQ_LEN + 1
-    window_df = df.iloc[window_start:i+1]  # i+1 because iloc is exclusive on the end
-    target_idx = i
-    targets = df.iloc[target_idx][['temp_t+1hr', 'temp_t+2hr', 'temp_t+3hr']]
-    actuals = targets  # each horizon's actual is written independently if available
 
-    # Normalize - window_df should have exactly SEQ_LEN rows
-    if len(window_df) != SEQ_LEN:
-        print(f"⚠️ Skipping row {i}: insufficient data for sequence (have {len(window_df)}, need {SEQ_LEN})")
+    if window_start < 0:
+        print(f"⚠️ Skipping row {i}: insufficient data for sequence")
         continue
 
-    window = window_df[FEATURE_ORDER].values  # Shape: (SEQ_LEN, FEATURE_COUNT)
-    scaled_window = np.empty_like(window)
-    for j, feature in enumerate(FEATURE_ORDER):
-        f_min = input_scaler[feature]["min"]
-        f_max = input_scaler[feature]["max"]
-        scaled_window[:, j] = (window[:, j] - f_min) / (f_max - f_min)
+    scaled_window = scaled_data[window_start:i+1]  # shape (SEQ_LEN, FEATURE_COUNT)
+
+    if len(scaled_window) != SEQ_LEN:
+        print(f"⚠️ Skipping row {i}: insufficient data for sequence (have {len(scaled_window)}, need {SEQ_LEN})")
+        continue
+
+    targets = targets_arr[i]
+    actuals = targets  # each horizon's actual is written independently if available
 
     try:
-        preds, t_inf = predict_on_window(scaled_window, interpreter, input_index, output_index)
+        preds, t_inf = predict_on_window(
+            scaled_window, interpreter, input_index,
+            input_scale, input_zero_point,
+            output_indices, output_scales, output_zero_points,
+            input_buffer,
+        )
     except Exception as e:
         print(f"⚠️ Exception in prediction at row {i}")
         print(f"  Error: {e}")
         continue
 
     try:
-        inference_times.append(t_inf)
+        run_count += 1
+        run_sum += t_inf
+        if t_inf < run_min: run_min = t_inf
+        if t_inf > run_max: run_max = t_inf
 
-        timestamp = df.index[target_idx]
-        current_temp = df.iloc[target_idx]['temperature']
-        temp_lag30 = df.iloc[target_idx]['temp_lag30']
+        timestamp = timestamps[i]
+        current_temp = float(temperatures[i])
+        temp_lag30 = float(temp_lag30_arr[i])
         prediction_points.extend(create_influx_points(timestamp, actuals, preds, current_temp, temp_lag30))
 
-        # Write every (BATCH_SIZE / 4) predictions
-        if len(inference_times) % (BATCH_SIZE / 4) == 0:
-            print(f"After {len(inference_times)} runs:")
-            print(f"  Avg Inference Time: {np.mean(inference_times):.2f} ms")
-            print(f"  Min Inference Time: {np.min(inference_times):.2f} ms")
-            print(f"  Max Inference Time: {np.max(inference_times):.2f} ms")
+        if run_count % WRITE_EVERY == 0:
+            print(f"After {run_count} runs:")
+            print(f"  Avg Inference Time: {run_sum / run_count:.2f} ms")
+            print(f"  Min Inference Time: {run_min:.2f} ms")
+            print(f"  Max Inference Time: {run_max:.2f} ms")
 
             writer_client.write_points(prediction_points, time_precision='ms')
             prediction_points = []
 
-        # Reset interpreter every 10k runs to avoid TPU HIB errors
-        if len(inference_times) % (BATCH_SIZE / 2) == 0:
-            print("🔁 Resetting interpreter after 10k runs to avoid TPU HIB errors...")
-            interpreter = tflite.Interpreter(
-                model_path=MODEL_PATH,
-                experimental_delegates=[tflite.load_delegate('libedgetpu.so.1')]
-            )
-            interpreter.allocate_tensors()
-            input_details = interpreter.get_input_details()
-            output_details = interpreter.get_output_details()
-            input_index = input_details[0]['index']
-            output_index = output_details[0]['index']
-
-        # Restart process every 100k runs to fully reset TPU state
-        if len(inference_times) % BATCH_SIZE == 0:
-            print("🧼 Restarting process after 100k runs to fully reset TPU state...")
+        # Restart process fully to reset TPU state.
+        if run_count % RESTART_EVERY == 0:
+            print("🧼 Restarting process to fully reset TPU state...")
             print("🧼 Exiting to allow external restart...")
-            sys.exit(88)  # Special exit code recognized by wrapper
+            _exit_restart_for_wrapper()
 
     except Exception as e:
         print(f"⚠️ Exception during Influx write prep at row {i}")
         print(f"  preds: shape = {preds.shape}, values = {preds}")
-        print(f"  targets: shape = {targets.shape}, values = {targets}")
+        print(f"  targets: {targets}")
         print(f"  Error: {e}")
         continue
 
@@ -403,3 +476,20 @@ if prediction_points:
     writer_client.write_points(prediction_points, time_precision='ms')
 
 print("✅ Inference complete.")
+
+# If the query window ended in the past, there is likely more data in InfluxDB.
+# Checking the time window (not point count) handles sparse/gappy data correctly —
+# a gap-heavy batch may return fewer than QUERY_BATCH_SIZE points even mid-dataset.
+end_ts_dt = pd.to_datetime(end_ts)
+if end_ts_dt.tzinfo is None:
+    end_ts_dt = end_ts_dt.tz_localize('UTC')
+now_utc = pd.Timestamp.now(tz='UTC')
+if end_ts_dt < now_utc - pd.Timedelta(hours=1):
+    print(f"📦 Query window ended at {end_ts_dt} (past) — more data may exist. Restarting to fetch next batch...")
+    _exit_restart_for_wrapper()
+
+# Use os._exit to bypass Python interpreter shutdown — the EdgeTPU native delegate
+# segfaults during normal teardown.
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(0)
