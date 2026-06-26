@@ -15,8 +15,8 @@ print("Querying data from InfluxDB...")
 
 # Fetch all data in 60-day chunks to stay under max-select-point limit
 chunk_days = 60
-fetch_start = datetime(2023, 10, 10, tzinfo=timezone.utc)
-fetch_end   = datetime(2026, 4, 8, tzinfo=timezone.utc)
+fetch_start = datetime(2020, 7, 25, tzinfo=timezone.utc)
+fetch_end   = datetime(2026, 6, 24, tzinfo=timezone.utc)
 
 chunks = []
 chunk_start = fetch_start
@@ -40,6 +40,14 @@ df['time'] = pd.to_datetime(df['time'])
 df.set_index('time', inplace=True)
 df.sort_index(inplace=True)
 
+# Overwrite the WF device 'timestamp' field with the InfluxDB index (always valid,
+# unlike the device field which is absent/zero in older backfilled records).
+df['timestamp'] = df.index.astype('int64') // 1_000_000_000
+
+# Drop columns not used in training
+df.drop(columns=['humidity', 'firmware_revision', 'report_interval', 'wind_sample_interval'],
+        errors='ignore', inplace=True)
+
 # Add derived features
 df['day_of_year'] = df.index.dayofyear
 df['time_of_day'] = df.index.hour + df.index.minute / 60.0
@@ -60,10 +68,10 @@ required_fields = [
 df_clean = df.dropna(subset=required_fields)
 
 # Training: all data up to 2025-04-06; Validation: last year (2025-04-07 to 2026-04-07)
-train_start = pd.Timestamp('2023-10-10T00:00:00Z')
-train_end   = pd.Timestamp('2025-04-06T23:59:59Z')
-val_start   = pd.Timestamp('2025-04-07T00:00:00Z')
-val_end     = pd.Timestamp('2026-04-07T23:59:59Z')
+train_start = pd.Timestamp('2020-07-25T00:00:00Z')
+train_end   = pd.Timestamp('2025-06-22T23:59:59Z')
+val_start   = pd.Timestamp('2025-06-23T00:00:00Z')
+val_end     = pd.Timestamp('2026-06-23T23:59:59Z')
 
 train_df = df_clean[(df_clean.index >= train_start) & (df_clean.index <= train_end)]
 val_df   = df_clean[(df_clean.index >= val_start)   & (df_clean.index <= val_end)]
