@@ -2,18 +2,7 @@ import subprocess
 import argparse
 from influxdb import InfluxDBClient
 
-MEASUREMENT = "model_5b"
-
-print(f"🧹 Dropping '{MEASUREMENT}' for fresh start...")
-try:
-    client = InfluxDBClient(host="localhost", port=8086,
-                            username="admin", password="24planet",
-                            database="weather")
-    client.query(f'DROP MEASUREMENT "{MEASUREMENT}"')
-    print(f"  ✔ Dropped '{MEASUREMENT}'")
-except Exception as e:
-    print(f"  ⚠️ Could not drop '{MEASUREMENT}': {e}")
-
+MEASUREMENT = "model_5b_exp37"
 SCRIPT = "Inference_InfluxDB_Writer.py"
 DEFAULT_TPUS = "auto"
 MAX_TPU_PROBE = 8
@@ -27,7 +16,6 @@ def _parse_tpus(tpus_arg: str):
 
 
 def _discover_tpus_auto():
-    # Probe delegate by index (works without PyCoral).
     try:
         import tflite_runtime.interpreter as tflite
 
@@ -41,7 +29,6 @@ def _discover_tpus_auto():
             except Exception:
                 continue
             finally:
-                # Release delegate handle before running the actual script.
                 if delegate is not None:
                     del delegate
 
@@ -55,13 +42,30 @@ def _discover_tpus_auto():
     return ["0"]
 
 
-parser = argparse.ArgumentParser(description="Run inference script and rotate TPUs on restart.")
+parser = argparse.ArgumentParser(description="Run Exp 37 inference script and rotate TPUs on restart.")
 parser.add_argument(
     "--tpus",
     default=DEFAULT_TPUS,
     help='Comma-separated TPU device IDs, or "auto" to discover available TPUs (default: auto).',
 )
+parser.add_argument(
+    "--fresh",
+    action="store_true",
+    help=f"Drop the '{MEASUREMENT}' measurement before starting for a clean backfill.",
+)
 args = parser.parse_args()
+
+if args.fresh:
+    print(f"🧹 Dropping '{MEASUREMENT}' for fresh start...")
+    try:
+        client = InfluxDBClient(host="localhost", port=8086,
+                                username="admin", password="24planet",
+                                database="weather")
+        client.query(f'DROP MEASUREMENT "{MEASUREMENT}"')
+        print(f"  ✔ Dropped '{MEASUREMENT}'")
+    except Exception as e:
+        print(f"  ⚠️ Could not drop '{MEASUREMENT}': {e}")
+
 tpus = _discover_tpus_auto() if args.tpus.strip().lower() == "auto" else _parse_tpus(args.tpus)
 idx = 0
 
@@ -69,7 +73,7 @@ while True:
     tpu_id = tpus[idx]
     print(f"🚀 Launching inference script on TPU {tpu_id}...")
     result = subprocess.run(["python3", SCRIPT, "--tpu", tpu_id])
-    
+
     if result.returncode == 88:
         idx = (idx + 1) % len(tpus)
         print(f"🔁 Restart requested by script. Switching to next TPU ({tpus[idx]}).")

@@ -13,3 +13,4 @@ workspace/*.csv
 
 # Per-location data subdirectories
 workspace/export_influx_to_csv.py
+*.json

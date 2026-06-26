@@ -618,36 +618,27 @@ def main():
     val_df = _apply_gap_safety(val_df, "val_df", SEQ_LEN, GAP_STEP_TOLERANCE_S)
 
     # Define feature and target columns.
-    # Exp 40: Two-stream architecture — conv features first so Conv2D path can slice
-    # input[:, :, :n_conv] without a gather op (StridedSlice is Edge TPU-compatible).
+    # Exp 38: Two-stream architecture — raw sensors first so Conv2D path can slice
+    # input[:, :, :n_raw] without a gather op (StridedSlice is Edge TPU-compatible).
     #
-    # Stream A (Conv2D): physical sensors + slow seasonal cycle — no diurnal, no lag/slope.
-    #   Diurnal dominance (Exp 39): time_of_day_* visible across 180 timesteps let Conv2D
-    #   shortcut on "what time is it?" instead of learning multi-sensor dynamics.
-    #   Diurnal features are placed after n_conv so only the anchor path sees them.
-    #   day_of_year_sin/cos remain — slow annual cycle, not the daily shortcut.
-    # Stream B (anchor): last timestep across all n_features — sees diurnal features too.
+    # Stream A (Conv2D): raw sensor measurements only — no pre-computed lags or slopes.
+    #   Forces the Conv2D to learn temporal dynamics it cannot shortcut via anchor features.
+    # Stream B (anchor): last timestep across all n_features — unchanged from Exp 37.
     #   Retains direct weight paths for temp_lag60/120/180 and all slope features.
-    conv_features = [
+    raw_features = [
         'temperature',
         'uv', 'wind_avg', 'wind_gust',
         'solar_radiation', 'illuminance',
         'relative_humidity', 'station_pressure',
         'day_of_year_sin', 'day_of_year_cos',
-    ]
-    if 'wind_direction_sin' in train_df.columns:
-        conv_features.extend(['wind_direction_sin', 'wind_direction_cos'])
-    if 'wind_lull' in train_df.columns:
-        conv_features.append('wind_lull')
-    if 'rain_accumulated' in train_df.columns:
-        conv_features.append('rain_accumulated')
-
-    # Diurnal features: routed to anchor path only (excluded from Conv2D slice).
-    # Placed between conv_features and engineered_features so the prefix slice
-    # input[:, :, :n_conv] naturally excludes them without a gather op.
-    diurnal_features = [
         'time_of_day_sin', 'time_of_day_cos', 'time_of_day_sin2', 'time_of_day_cos2',
     ]
+    if 'wind_direction_sin' in train_df.columns:
+        raw_features.extend(['wind_direction_sin', 'wind_direction_cos'])
+    if 'wind_lull' in train_df.columns:
+        raw_features.append('wind_lull')
+    if 'rain_accumulated' in train_df.columns:
+        raw_features.append('rain_accumulated')
 
     engineered_features = [
         'temp_delta_1',
@@ -656,7 +647,7 @@ def main():
         'solar_slope_30', 'humidity_slope_30', 'pressure_slope_60',
     ]
 
-    features = conv_features + diurnal_features + engineered_features
+    features = raw_features + engineered_features
     targets = ['temp_diff_1hr', 'temp_diff_2hr', 'temp_diff_3hr']
 
     ## Per-feature min/max scaling with ±5% padding
@@ -778,7 +769,7 @@ def main():
 
 
     n_features = len(features)
-    n_conv = len(conv_features)  # Exp 40: Conv2D path sees only the first n_conv features (no diurnal, no lag/slope)
+    n_raw = len(raw_features)  # Exp 38: Conv2D path sees only the first n_raw features
 
     # Use the scaled targets (already in [-1, 1]) to align with sequence windows
     y_all_train = train_df[targets].values
@@ -789,9 +780,10 @@ def main():
     
     # Larger batches = more work per GPU call = better GPU utilization.
     # T4/Kaggle: 1024 fills more of the 13.7 GB VRAM per step.
-    # Local Metal: 512 avoids over-committing the shared GPU memory.
-    TRAIN_BATCH_SIZE = 1024 if KAGGLE_MODE else 512
-    VAL_BATCH_SIZE = 1024 if KAGGLE_MODE else 512
+    # Local Metal: 1024 on M1 Pro (16 GB unified) — GPU runs at ~80% at 512 (compute-bound,
+    # not memory-bound), so doubling batch halves step count with minimal memory risk.
+    TRAIN_BATCH_SIZE = 1024
+    VAL_BATCH_SIZE = 1024
 
     
     train_ds = timeseries_dataset_from_array(
@@ -1336,20 +1328,23 @@ def main():
         print(f"\n--- Running: {name} ---\n")
 
         # ---------------------------------------------------------------------
-        # Experiment 40: Two-stream architecture — Conv2D sees physical sensors only.
+        # Experiment 39: Dilated convolutions — expanding temporal receptive field.
         #
-        # Exp 38 established the two-stream design (Conv2D sees raw sensors, anchor
-        # sees all features). Exp 39 added dilated Conv2D for wider receptive field
-        # (~251 min) but Diurnal Dominance persisted: time_of_day_sin2 ranked #1.
+        # Exp 38 established the two-stream architecture (Conv2D on raw sensors,
+        # anchor on all 28 features). The remaining limitation: the stacked Conv2D
+        # kernels (3,1)→(7,1)→(15,1) with dilation=1 give a combined temporal
+        # receptive field of only 23 timesteps = 23 minutes. Multi-hour weather
+        # patterns (approaching fronts, marine layer, solar ramp-downs from cloud
+        # decks) are invisible within that window regardless of sequence length.
         #
-        # Exp 40 removes diurnal features from the Conv2D slice. They still reach
-        # the anchor path (input[:, -1, :] is over all n_features). Only physical
-        # sensors remain visible to Conv2D, forcing it to learn multi-sensor dynamics
-        # rather than shortcutting on "what time of day is it?"
+        # Exp 39 adds exponential dilation to layers 2 and 3, expanding RF from
+        # 23 min to ~251 min (~4 hours) with zero additional parameters:
+        #   conv2d_t2: k=(7,1), d=4  → RF: 3 + 4×6  =  27 min
+        #   conv2d_t3: k=(15,1), d=16 → RF: 27 + 16×14 = 251 min
         #
-        # Stream A — Conv2D path (physical sensors only, no diurnal/lag/slope):
-        #   input[:, :, :n_conv] → Reshape(SEQ_LEN, n_conv, 1)
-        #   → Conv2D(96) blocks → GAP → Dense(64) → context(64)
+        # Stream A — Conv2D path (raw n_raw sensors, no lag/slope):
+        #   input[:, :, :n_raw] → Reshape(SEQ_LEN, n_raw, 1)
+        #   → Conv2D(96) blocks (dilated) → GAP → Dense(64) → context(64)
         # Stream B — Anchor path (full n_features, current timestep):
         #   input[:, -1, :] → Dense(32) → ReLU6 → anchor(32)
         # Concatenate([context(64), anchor(32)]) → Dense(32) → ReLU6 → 3 heads
@@ -1372,32 +1367,32 @@ def main():
             anchor_vec = tf.keras.layers.Dense(32, use_bias=False, kernel_regularizer=l2(1e-4), name="dense_anchor")(anchor_vec)
             anchor_vec = tf.keras.layers.ReLU(max_value=6.0, name="relu_anchor")(anchor_vec)
 
-            # Slice conv features for Conv2D path (StridedSlice — Edge TPU ✅)
-            # Diurnal and engineered features are excluded: Conv2D must learn temporal
-            # dynamics from physical sensor readings without time-of-day shortcuts.
-            raw_input = input_layer[:, :, :n_conv]
+            # Slice raw sensor features for Conv2D path (StridedSlice — Edge TPU ✅)
+            # Engineered features (lag/slope) are excluded: Conv2D must learn temporal
+            # dynamics independently rather than re-reading what the anchor already has.
+            raw_input = input_layer[:, :, :n_raw]
 
-            # Reshape to 4D: (batch, SEQ_LEN, n_conv, 1) — single-channel "image"
-            x = tf.keras.layers.Reshape((SEQ_LEN, n_conv, 1), name="reshape")(raw_input)
+            # Reshape to 4D: (batch, SEQ_LEN, n_raw, 1) — single-channel "image"
+            x = tf.keras.layers.Reshape((SEQ_LEN, n_raw, 1), name="reshape")(raw_input)
 
             # Block 1: short temporal patterns (3 timesteps, independent per feature)
             x = tf.keras.layers.Conv2D(FILTERS, kernel_size=(3, 1), padding='same', use_bias=False, kernel_regularizer=l2(1e-4), name="conv2d_t1")(x)
             x = tf.keras.layers.BatchNormalization(name="bn_t1")(x)
             x = tf.keras.layers.ReLU(max_value=6.0, name="relu_t1")(x)
 
-            # Block 2: medium temporal patterns (7 timesteps)
-            x = tf.keras.layers.Conv2D(FILTERS, kernel_size=(7, 1), padding='same', use_bias=False, kernel_regularizer=l2(1e-4), name="conv2d_t2")(x)
+            # Block 2: medium temporal patterns — dilation=4 expands RF from 9 → 27 min
+            x = tf.keras.layers.Conv2D(FILTERS, kernel_size=(7, 1), dilation_rate=(4, 1), padding='same', use_bias=False, kernel_regularizer=l2(1e-4), name="conv2d_t2")(x)
             x = tf.keras.layers.BatchNormalization(name="bn_t2")(x)
             x = tf.keras.layers.ReLU(max_value=6.0, name="relu_t2")(x)
 
-            # Block 3: longer temporal patterns (15 timesteps)
-            x = tf.keras.layers.Conv2D(FILTERS, kernel_size=(15, 1), padding='same', use_bias=False, kernel_regularizer=l2(1e-4), name="conv2d_t3")(x)
+            # Block 3: long temporal patterns — dilation=16 expands RF from 23 → ~251 min (~4 hrs)
+            x = tf.keras.layers.Conv2D(FILTERS, kernel_size=(15, 1), dilation_rate=(16, 1), padding='same', use_bias=False, kernel_regularizer=l2(1e-4), name="conv2d_t3")(x)
             x = tf.keras.layers.BatchNormalization(name="bn_t3")(x)
             x = tf.keras.layers.ReLU(max_value=6.0, name="relu_t3")(x)
 
-            # Block 4: feature mixing — kernel spans all n_conv conv features, collapses feature dim
+            # Block 4: feature mixing — kernel spans all n_raw raw features, collapses feature dim
             # Output shape: (batch, SEQ_LEN, 1, FILTERS)
-            x = tf.keras.layers.Conv2D(FILTERS, kernel_size=(1, n_conv), padding='valid', use_bias=False, kernel_regularizer=l2(1e-4), name="conv2d_feat")(x)
+            x = tf.keras.layers.Conv2D(FILTERS, kernel_size=(1, n_raw), padding='valid', use_bias=False, kernel_regularizer=l2(1e-4), name="conv2d_feat")(x)
             x = tf.keras.layers.BatchNormalization(name="bn_feat")(x)
             x = tf.keras.layers.ReLU(max_value=6.0, name="relu_feat")(x)
 
@@ -1449,7 +1444,9 @@ def main():
 
         # Check for existing checkpoints to resume training
         initial_epoch = 0
-        checkpoint_dir = "./checkpoints"
+        # On Kaggle the restore block copies into ./checkpoints/ before training;
+        # locally we use a name-scoped directory so exp38 and exp39 don't collide.
+        checkpoint_dir = "./checkpoints" if KAGGLE_MODE else f"./checkpoints_{name}"
         os.makedirs(checkpoint_dir, exist_ok=True)  # Ensure directory exists
         es_state_path = os.path.join(checkpoint_dir, "early_stopping_state.json")
         lr_state_path = os.path.join(checkpoint_dir, "lr_state.json")
@@ -1860,18 +1857,18 @@ def main():
             filepath="./checkpoints/best_model.weights.h5",  # Fixed filename since save_best_only=True
             save_weights_only=True,
             save_best_only=True,
-            monitor="val_task_loss",
+            monitor="val_loss",
             mode="min",
             verbose=0
         )
-
+        
         # ALSO save best full model as backup (dual backup strategy)
         # This ensures we always have both formats available
         best_full_model_cb = tf.keras.callbacks.ModelCheckpoint(
             filepath="./checkpoints/best_model_full.weights.h5",
             save_weights_only=True,   # Weights-only avoids optimizer lambda serialization warning
             save_best_only=True,
-            monitor="val_task_loss",
+            monitor="val_loss",
             mode="min",
             verbose=0
         )
@@ -1919,9 +1916,10 @@ def main():
             Replaces separate checkpoint_cb and best_full_model_cb ModelCheckpoint
             callbacks.  Those callbacks reset their internal 'best' to float('inf')
             on every process restart, causing two extra save_weights() calls on the
-            first epoch.  Combined with the GPU read in CheckpointValidationCallback,
-            that was 4 Metal GPU interactions per epoch-end — enough to corrupt the
-            Metal command queue and deadlock batch 0 of the next epoch.
+            first epoch (val_task_loss always beats inf).  Combined with the GPU read in
+            CheckpointValidationCallback, that was 4 Metal GPU interactions per
+            epoch-end — enough to corrupt the Metal command queue and deadlock
+            batch 0 of the next epoch.
 
             This callback does exactly one save_weights() per epoch, then copies
             the file to best_model.weights.h5 if val_task_loss improved (shutil.copy2
@@ -1929,8 +1927,8 @@ def main():
             EarlyStopping state so the threshold carries across restarts.
 
             Monitors val_task_loss (sum of per-head losses, no L2) rather than
-            val_loss.  For dilated Conv2D architectures L2 grows with weight
-            magnitudes, inflating val_loss throughout training and making it an
+            val_loss.  For dilated Conv2D architectures, L2 grows with weight
+            magnitudes and inflates val_loss throughout training, making it an
             unreliable checkpoint criterion.  TaskLossLogger must run before this
             callback in the callback list.
             """
@@ -1990,9 +1988,9 @@ def main():
             """Logs val_task_loss = sum of per-head task losses (no L2 regularization).
 
             val_loss includes L2 from all Dense and Conv2D layers, which grows as
-            weights increase during training.  For dilated Conv2D kernels this
-            inflates val_loss ~6-7x relative to the per-head MSE sum, making it an
-            unreliable signal for checkpointing, early stopping, and LR scheduling.
+            weights increase during training.  For dilated Conv2D kernels (Exp 39+),
+            this inflates val_loss ~6–7× relative to the per-head MSE sum, making it
+            an unreliable signal for checkpointing, early stopping, and LR scheduling.
 
             Must be listed FIRST in active_callbacks so val_task_loss is in logs
             when EarlyStopping, LatestEpochSaver, and ReduceLRCallback execute.
@@ -2123,8 +2121,8 @@ def main():
         # preamble added an extra Metal GPU read every epoch, contributing to the command-queue
         # corruption that hangs batch 0 of the next epoch on macOS Metal.
 
-        # Seed from restored EarlyStopping.best (a val_task_loss value after change) so the
-        # threshold carries across restarts without overwriting best_model.weights.h5 on epoch 1.
+        # Seed from restored EarlyStopping.best (a val_task_loss value) so the threshold
+        # carries across restarts and we don't overwrite best_model.weights.h5 on epoch 1.
         _initial_best = getattr(early_stopping, 'best', float('inf'))
         if not isinstance(_initial_best, float) or _initial_best != _initial_best:  # nan check
             _initial_best = float('inf')
@@ -2135,7 +2133,7 @@ def main():
         # Lower = safer (less Metal accumulation); higher = faster (overhead amortised).
         # With screen unlocked / caffeinate -d -i: try 5–10.
         # With screen locked (default macOS GPU power-down): keep at 1.
-        max_epochs_per_run = MaxEpochsPerRun(max_epochs_per_run=9999 if (KAGGLE_MODE or force_cpu) else 1)
+        max_epochs_per_run = MaxEpochsPerRun(max_epochs_per_run=9999 if (KAGGLE_MODE or force_cpu) else 99)
 
         # Match RPi5 configuration exactly
         # Note: The watchdog callback will monitor training and detect hangs
@@ -2190,7 +2188,7 @@ def main():
                         # extra Metal GPU read every epoch. Total epoch-end GPU interactions: 1.
                         reduce_lr,
                         lr_state_saver,       # after reduce_lr so saved best/wait reflect this epoch
-                        max_epochs_per_run,   # stop after N epochs for clean Metal context on restart
+                        max_epochs_per_run,   # stop after 1 epoch for clean Metal context on restart
                         watchdog,
                     ]
                 history = model.fit(
@@ -2200,7 +2198,7 @@ def main():
                     initial_epoch=initial_epoch,
                     steps_per_epoch=train_steps,
                     callbacks=active_callbacks,
-                    verbose=2 if KAGGLE_MODE else 1,
+                    verbose=2,  # one line per epoch; verbose=1 wastes I/O on 1025 progress bar updates
                 )
             except KeyboardInterrupt as e:
                 # Check if this was triggered by the watchdog
@@ -2390,7 +2388,7 @@ def main():
         tflite_model_size_kb = os.path.getsize(tflite_fname) / 1024
 
         # Determine best epoch from history if available, otherwise use initial_epoch.
-        # Add initial_epoch offset so the reported epoch is global (not session-local).
+        # Add initial_epoch offset so reported epoch is global (not session-local).
         if history and hasattr(history, 'history') and len(history.history.get('val_task_loss', [])) > 0:
             best_session_epoch = int(np.argmin(history.history['val_task_loss'])) + 1
             best_epoch = initial_epoch + best_session_epoch
@@ -2401,7 +2399,7 @@ def main():
             # No training occurred (already at max epoch), use the checkpoint epoch
             best_epoch = initial_epoch if initial_epoch > 0 else 1
             print(f"   Note: Using checkpoint epoch {best_epoch} as best epoch (no new training occurred)")
-
+        
         print(f"\nFinal Metrics [{name}]:")
         print(f"  val_loss: {val_loss:.4f}")
         print(f"  val_mae: {val_mae:.4f}")
@@ -2440,7 +2438,7 @@ def main():
 
     # Configuration
     NUM_RUNS = 1  # Number of training runs to perform
-    EXP_NAME = "conv2d_exp38"
+    EXP_NAME = "conv2d_exp39"
     for run_id in range(NUM_RUNS):
         run_name = f"{EXP_NAME}_run{run_id+1}"
         build_and_train_model(run_name)

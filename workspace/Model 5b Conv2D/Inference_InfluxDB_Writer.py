@@ -11,17 +11,43 @@ import tflite_runtime.interpreter as tflite
 import sys
 import atexit
 import pprint
+import argparse
 # --- Configuration ---
 MODEL_PATH = "weather_model_5b_best_edgetpu.tflite"
 SEQ_LEN = 180  # Sequence length matching training (3 hours of history)
 GAP_STEP_TOLERANCE_S = 180  # Gap policy tolerance - increased to be less aggressive (was 90)
 BATCH_SIZE = 50000
-QUERY_BATCH_SIZE = 200000
+QUERY_BATCH_SIZE = 80000  # InfluxDB server max-select-points limit is 100k; effective window = this + 2*SEQ_LEN(360) + EXTRA_SAMPLES(250)
 EXTRA_SAMPLES = 250  # Extra buffer beyond sequence and furthest target
 # FEATURE_COUNT will be determined dynamically based on available features
 # Base: temperature, temp_delta_1, + 22 base features + optional wind_direction (2), wind_lull (1), rain_accumulated (1)
 
-PROGRESS_PATH = "progress_diff.json"
+def _exit_restart_for_wrapper():
+    """Tell run_with_restart.py to launch another batch (exit 88).
+
+    Use os._exit instead of sys.exit: after a long Edge TPU run, interpreter
+    shutdown can segfault in native delegate teardown (parent would see -11).
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(88)
+
+
+def _build_delegate_options(tpu_arg: str):
+    """Return EdgeTPU delegate options for an optional TPU selector."""
+    if not tpu_arg:
+        return None
+
+    tpu_arg = str(tpu_arg).strip()
+    if not tpu_arg:
+        return None
+
+    # Accept either explicit forms (usb:0, pci:1, :0) or plain numeric ids (0, 1, ...).
+    if ":" in tpu_arg:
+        device = tpu_arg
+    else:
+        device = f":{tpu_arg}"
+    return {"device": device}
 
 def save_progress(last_timestamp):
     """Persist the last *committed* prediction timestamp."""
@@ -35,17 +61,19 @@ def load_progress():
             return json.load(f).get("last_timestamp")
     return None
 
-# Base feature order (Model 5b starts with temperature and temp_delta_1)
-# Note: Final FEATURE_ORDER will be read from input_scaler_5b.json to match training exactly
+# Base feature order for reference — actual FEATURE_ORDER is read from input_scaler_5b.json.
+# Exp 29: 27 features (21 base + temp_lag60 + temp_lag120 + 6 rolling-regression slopes).
 FEATURE_ORDER_BASE = [
-    'temperature',
-    'temp_delta_1',
+    'temperature', 'temp_delta_1',
+    'temp_lag60', 'temp_lag120',
+    'temp_slope_15', 'temp_slope_30', 'temp_slope_60',
+    'solar_slope_30', 'humidity_slope_30', 'pressure_slope_60',
     'uv', 'wind_avg', 'wind_gust',
     'solar_radiation', 'illuminance',
     'relative_humidity', 'station_pressure',
     'day_of_year_sin', 'day_of_year_cos',
     'time_of_day_sin', 'time_of_day_cos', 'time_of_day_sin2', 'time_of_day_cos2',
-    # NO lag features - Conv2D learns temporal patterns from the sequence
+    'wind_direction_sin', 'wind_direction_cos', 'wind_lull', 'rain_accumulated',
 ]
 
 # --- Functions ---
@@ -80,10 +108,18 @@ def apply_gap_policy(df: pd.DataFrame, seq_len: int, gap_step_tolerance_s: int) 
             gap_size = dt_s.iloc[pos]
             print(f"   Gap at {gap_time}: {gap_size:.1f}s")
 
-    # Zero temp_delta_1 at the first row after each gap (prevents huge delta caused by missing minutes)
-    if 'temp_delta_1' in df.columns:
-        idx_after_gap = df.index[gap_positions]
-        df.loc[idx_after_gap, 'temp_delta_1'] = 0.0
+    # Zero point-difference and slope features at the first row after each gap.
+    # temp_delta_1: zeroed because it would otherwise show a huge 1-step jump.
+    # slope features: zeroed at the gap boundary row; the next slope_window-1 rows will
+    # still have slopes computed from a mixed pre/post-gap window, but rows are kept for
+    # continuous predictions. Impact is small and rare in practice.
+    idx_after_gap = df.index[gap_positions]
+    _zero_at_gap = ['temp_delta_1',
+                    'temp_slope_15', 'temp_slope_30', 'temp_slope_60',
+                    'solar_slope_30', 'humidity_slope_30', 'pressure_slope_60']
+    for col in _zero_at_gap:
+        if col in df.columns:
+            df.loc[idx_after_gap, col] = 0.0
 
     # GAP POLICY: Row dropping DISABLED
     # Since you have continuous data and use timestamp-based targets (merge_asof), we don't need to drop rows.
@@ -126,25 +162,37 @@ def create_influx_point(timestamp, actuals, preds, current_temp):
     This script assumes diffs are (future - current), so predicted future temps are:
       pred_temp = current_temp + pred_diff
     """
-    # Predicted future temperatures from predicted diffs
     pred_1hr_temp = float(current_temp) + float(preds[0])
     pred_2hr_temp = float(current_temp) + float(preds[1])
     pred_3hr_temp = float(current_temp) + float(preds[2])
 
+    fields = {
+        "pred_1hr_temperature": pred_1hr_temp,
+        "pred_2hr_temperature": pred_2hr_temp,
+        "pred_3hr_temperature": pred_3hr_temp,
+    }
+
+    # Only include actuals when future temperatures are available (historical rows)
+    if actuals is not None:
+        fields["actual_1hr_temperature"] = float(actuals['temp_t+1hr'])
+        fields["actual_2hr_temperature"] = float(actuals['temp_t+2hr'])
+        fields["actual_3hr_temperature"] = float(actuals['temp_t+3hr'])
+
     return {
         "measurement": "model_5b",
         "time": timestamp.isoformat(),
-        "fields": {
-            "actual_1hr_temperature": float(actuals['temp_t+1hr']),
-            "actual_2hr_temperature": float(actuals['temp_t+2hr']),
-            "actual_3hr_temperature": float(actuals['temp_t+3hr']),
-            "pred_1hr_temperature": pred_1hr_temp,
-            "pred_2hr_temperature": pred_2hr_temp,
-            "pred_3hr_temperature": pred_3hr_temp,
-        },
+        "fields": fields,
     }
 
 # --- Load Scaler Parameters ---
+parser = argparse.ArgumentParser(description="Run Model 5b inference and write results to InfluxDB.")
+parser.add_argument(
+    "--tpu",
+    default="",
+    help="EdgeTPU device selector (examples: 0, :0, usb:0, pci:0).",
+)
+args = parser.parse_args()
+
 print("Loading input scaler...")
 with open("input_scaler_5b.json", "r") as f:
     input_scaler = json.load(f)
@@ -238,9 +286,16 @@ writer_client = InfluxDBClient(
 
 # --- Load Model ---
 print("Loading TFLite model with EdgeTPU delegate...")
+delegate_options = _build_delegate_options(args.tpu)
+if delegate_options:
+    print(f"Using EdgeTPU device: {delegate_options['device']}")
+    edgetpu_delegate = tflite.load_delegate('libedgetpu.so.1', delegate_options)
+else:
+    edgetpu_delegate = tflite.load_delegate('libedgetpu.so.1')
+
 interpreter = tflite.Interpreter(
     model_path=MODEL_PATH,
-    experimental_delegates=[tflite.load_delegate('libedgetpu.so.1')]
+    experimental_delegates=[edgetpu_delegate]
 )
 interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
@@ -258,62 +313,37 @@ def _extract_interpreter_constants(interp_input_details, interp_output_details):
 input_index, input_scale, input_zero_point, output_indices, output_scales, output_zero_points = \
     _extract_interpreter_constants(input_details, output_details)
 
-# --- Query Historic Data ---
-print("Querying data from InfluxDB...")
-drop_measurements = False
+# --- Determine Resume Point from InfluxDB ---
+print("Checking InfluxDB for last prediction timestamp...")
 last_ts = None
-progress_exists = os.path.exists(PROGRESS_PATH)
-
-# 1) Primary source of truth: progress_diff.json (if present)
-if progress_exists:
-    try:
-        with open(PROGRESS_PATH) as f:
-            progress_data = json.load(f)
-        last_ts = progress_data.get("last_timestamp")
-        if last_ts:
-            print(f"📁 Resuming from progress file; last_timestamp = {last_ts}")
-        else:
-            print("⚠️ Progress file found but last_timestamp is missing or empty.")
-    except Exception as e:
-        print(f"⚠️ Could not read progress file {PROGRESS_PATH}: {e}")
-        last_ts = None
-else:
-    # No progress file -> user wants to start from scratch
-    print("📄 progress_diff.json not found; starting full recompute from the beginning.")
-    drop_measurements = True
-
-# 2) Optional fallback to InfluxDB *only if* a progress file exists but has no usable timestamp
-if progress_exists and last_ts is None:
-    try:
-        print("🔎 Progress file unusable; checking last prediction time from InfluxDB (model_5b)...")
-        last_pred_result = writer_client.query('SELECT LAST("pred_1hr_temperature") FROM "model_5b"')
-        last_points = list(last_pred_result.get_points())
-        if last_points:
-            last_ts = last_points[0]['time']
-            drop_measurements = False  # we are continuing from existing data
-            print(f"  ✔ Found last prediction at {last_ts} (from InfluxDB)")
-        else:
-            print("  ℹ️ No previous predictions found in InfluxDB (model_5b). Will recompute from scratch.")
-            drop_measurements = True
-    except Exception as e:
-        print(f"  ⚠️ Could not determine last prediction from InfluxDB: {e}")
-        # If we got here via a bad progress file, safest is to recompute and drop old predictions
-        drop_measurements = True
-        last_ts = None
+try:
+    last_pred_result = writer_client.query('SELECT LAST("pred_1hr_temperature") FROM "model_5b"')
+    last_points = list(last_pred_result.get_points())
+    if last_points:
+        last_ts = last_points[0]['time']
+        print(f"📁 Resuming from InfluxDB; last_timestamp = {last_ts}")
+    else:
+        print("📄 No previous predictions in InfluxDB; starting from the beginning.")
+except Exception as e:
+    print(f"⚠️ Could not query InfluxDB for last prediction: {e}")
+    print("📄 Starting from the beginning.")
 
 # Only select the fields needed for feature generation and inference
 fields = "temperature, relative_humidity, station_pressure, solar_radiation, illuminance, uv, wind_avg, wind_gust, wind_direction, wind_lull, rain_accumulated"
 
 if last_ts:
-    # When resuming, pull a lookback window BEFORE last_ts so that:
-    # - We can construct a full SEQ_LEN-long sequence for the very next timestep
-    # - There are no gaps in predictions between runs.
     last_ts_dt = pd.to_datetime(last_ts)
-    resume_from_dt = last_ts_dt - pd.Timedelta(minutes=SEQ_LEN)
-    end_dt = resume_from_dt + pd.Timedelta(minutes=QUERY_BATCH_SIZE + EXTRA_SAMPLES)
+    # Look back far enough to:
+    # 1. Re-process the last SEQ_LEN rows to backfill actuals now available
+    # 2. Provide a full SEQ_LEN input window for each of those backfill rows
+    # 3. Cover the temp_lag120 lookback (120 min behind the window start)
+    # 2 * SEQ_LEN = 360 min comfortably covers all three requirements.
+    backfill_lookback = pd.Timedelta(minutes=2 * SEQ_LEN)
+    resume_from_dt = last_ts_dt - backfill_lookback
     resume_from = resume_from_dt.isoformat()
+    end_dt = last_ts_dt + pd.Timedelta(minutes=QUERY_BATCH_SIZE + EXTRA_SAMPLES)
     end_ts = end_dt.isoformat()
-    print(f"Resuming from {last_ts_dt} with lookback starting at {resume_from_dt}")
+    print(f"Resuming from {last_ts_dt} with backfill lookback to {resume_from_dt}")
     query = f'SELECT {fields} FROM "wf/obs_st" WHERE time >= \'{resume_from}\' AND time <= \'{end_ts}\''
 else:
     # No usable timestamp -> full backfill; get earliest timestamp first (safe 1-point query)
@@ -364,18 +394,55 @@ df['time_of_day_cos2'] = np.cos(4 * np.pi * df['time_of_day'] / 24.0)
 df['day_of_year_sin'] = np.sin(2 * np.pi * df['day_of_year'] / 365.25)
 df['day_of_year_cos'] = np.cos(2 * np.pi * df['day_of_year'] / 365.25)
 
-# Temperature difference feature: current timestep temperature minus previous timestep temperature,
-# matching the training pipeline's temp_delta_1 feature.
+# Temperature difference feature (1-step, zeroed at gap boundaries by apply_gap_policy).
 df['temp_delta_1'] = df['temperature'].diff().fillna(0.0)
 
-# ---------------------------------------------------------------------
-# REMOVED LAG FEATURES: Conv2D learns temporal patterns from sequence
-#
-# Model 5b's Conv2D architecture learns temporal dependencies directly
-# from the 180-timestep sequence, so explicit lag features are not needed.
-# The multi-scale temporal processing and difference computation in the
-# Conv2D branch will discover these patterns automatically.
-# ---------------------------------------------------------------------
+# Explicit temperature lag features (Exp 29): time-based lookup matching the training
+# pipeline. merge_asof with direction='backward' finds the nearest past sample within
+# ±90 s of the target offset. Rows without a valid past sample become NaN and are
+# dropped later by dropna(subset=FEATURE_ORDER).
+def _past_temp_at(src_df: pd.DataFrame, offset: pd.Timedelta, tol: pd.Timedelta) -> np.ndarray:
+    base = pd.DataFrame({"base_time": src_df.index, "lookup_time": src_df.index - offset})
+    src  = pd.DataFrame({"src_time": src_df.index,
+                          "temperature": src_df['temperature'].to_numpy(dtype=np.float32)})
+    merged = pd.merge_asof(base, src, left_on="lookup_time", right_on="src_time",
+                           direction="backward", tolerance=tol)
+    return merged["temperature"].to_numpy(dtype=np.float32)
+
+_lag_tol = pd.Timedelta(seconds=90)
+df['temp_lag60']  = _past_temp_at(df, pd.Timedelta(minutes=60),  _lag_tol)
+df['temp_lag120'] = _past_temp_at(df, pd.Timedelta(minutes=120), _lag_tol)
+
+# Exp 29: rolling linear-regression slopes (Numba-accelerated, matching training).
+# NaN values at the start of each series (window not yet full) are dropped by
+# dropna() below. apply_gap_policy zeros slope values at gap boundary rows.
+def rolling_slope_numba(data, window):
+    """Vectorized rolling linear-regression slope (numpy, no numba dependency)."""
+    data = np.asarray(data, dtype=np.float64)
+    n = len(data)
+    slopes = np.full(n, np.nan)
+    x = np.arange(window, dtype=np.float64)
+    x_c = x - x.mean()
+    denom = np.sum(x_c ** 2)
+    shape = (n - window + 1, window)
+    strides = (data.strides[0], data.strides[0])
+    windows_view = np.lib.stride_tricks.as_strided(data, shape=shape, strides=strides)
+    has_nan = np.any(np.isnan(windows_view), axis=1)
+    y_means = np.nanmean(windows_view, axis=1)
+    y_c = windows_view - y_means[:, np.newaxis]
+    all_slopes = np.sum(x_c * y_c, axis=1) / denom
+    all_slopes[has_nan] = np.nan
+    slopes[window - 1:] = all_slopes
+    return slopes
+
+print("⚙️  Computing rolling slope features (Exp 29)...")
+df['temp_slope_15']      = rolling_slope_numba(df['temperature'].values,       15)
+df['temp_slope_30']      = rolling_slope_numba(df['temperature'].values,       30)
+df['temp_slope_60']      = rolling_slope_numba(df['temperature'].values,       60)
+df['solar_slope_30']     = rolling_slope_numba(df['solar_radiation'].values,   30)
+df['humidity_slope_30']  = rolling_slope_numba(df['relative_humidity'].values, 30)
+df['pressure_slope_60']  = rolling_slope_numba(df['station_pressure'].values,  60)
+print("   ✅ Slope features computed")
 
 # Apply training-time gap policy so inference windows never span missing-data gaps.
 df = apply_gap_policy(df, SEQ_LEN, GAP_STEP_TOLERANCE_S)
@@ -444,11 +511,10 @@ print(df[['temp_t+1hr', 'temp_t+2hr', 'temp_t+3hr']].isna().sum())
 
 print("\n🧪 Total rows before processing:", len(df))
 
-# Process the data but keep the extra rows for target validation
-required_fields = FEATURE_ORDER + ['temp_t+1hr', 'temp_t+2hr', 'temp_t+3hr']
+required_fields = FEATURE_ORDER
 
-# For inference, we only process up to the point where we have complete targets
-# This ensures we can validate predictions against actual future values
+# Drop rows where input features are incomplete.
+# Rows with NaN targets (last 3 hours) are kept — predictions are made without actuals.
 df.dropna(subset=required_fields, inplace=True)
 # Optimize memory usage: convert float64 to float32
 float_cols = df.select_dtypes(include=['float64']).columns
@@ -476,34 +542,17 @@ WRITE_EVERY   = BATCH_SIZE // 4   # flush to InfluxDB every N predictions
 # with no HIB errors. The TPU firmware self-manages via its own ~25-50k flush event (~58-88ms spike).
 RESTART_EVERY = 500_000           # full process restart every N predictions (was 200_000)
 
-if drop_measurements:
-    print("🧹 Dropping old prediction measurements...")
-    try:
-        writer_client.query('DROP MEASUREMENT "model_5b"')
-        print('  ✔ Dropped measurement: model_5b')
-    except Exception as e:
-        print(f"  ⚠️ Could not drop model_5b: {e}")
-
 # Calculate start_index AFTER dropping NaNs to ensure valid indices
 start_index = 0
 if last_ts:
     try:
-        last_ts_dt = pd.to_datetime(last_ts)
-        # Find the position of the last committed timestamp in the cleaned dataframe
-        pos = df.index.get_loc(last_ts_dt)
-        # Handle case where get_loc returns a slice or mask (shouldn't happen with unique index, but be safe)
-        if isinstance(pos, (slice, pd.Series, np.ndarray)):
-            if isinstance(pos, slice):
-                pos = pos.start if pos.start is not None else 0
-            else:
-                pos = int(pos[0]) if len(pos) > 0 else 0
-        else:
-            pos = int(pos)
-        # Start from the next row after the last committed prediction
-        start_index = pos + 1
-    except (KeyError, IndexError, TypeError):
-        # Timestamp not found in dataframe (might have been dropped due to NaNs)
-        print(f"⚠️  Last timestamp {last_ts} not found in cleaned dataframe, starting from beginning")
+        # Go back SEQ_LEN rows before last_ts to re-process predictions that
+        # now have actuals available. InfluxDB will merge the actual_* fields
+        # into the existing points without overwriting the pred_* fields.
+        backfill_from = pd.to_datetime(last_ts) - pd.Timedelta(minutes=SEQ_LEN)
+        start_index = df.index.searchsorted(backfill_from)
+    except Exception:
+        print(f"⚠️  Could not locate backfill position for {last_ts}, starting from beginning")
         start_index = 0
 
 # Need SEQ_LEN timesteps for the sequence, plus we need to be able to access targets
@@ -558,9 +607,11 @@ for i in range(min_start, len(df)):
         continue
 
     targets_row = targets_arr[i]
-    if np.any(np.isnan(targets_row)):
-        print(f"⚠️ Skipping row {i} due to NaNs in targets")
-        continue
+    actuals = None if np.any(np.isnan(targets_row)) else {
+        'temp_t+1hr': float(targets_row[0]),
+        'temp_t+2hr': float(targets_row[1]),
+        'temp_t+3hr': float(targets_row[2]),
+    }
 
     try:
         preds, t_inf = predict_on_window(
@@ -582,12 +633,7 @@ for i in range(min_start, len(df)):
 
         timestamp = timestamps[i]
         current_temp = float(temp_arr[i])
-        targets = {
-            'temp_t+1hr': float(targets_arr[i, 0]),
-            'temp_t+2hr': float(targets_arr[i, 1]),
-            'temp_t+3hr': float(targets_arr[i, 2]),
-        }
-        prediction_points.append(create_influx_point(timestamp, targets, preds, current_temp))
+        prediction_points.append(create_influx_point(timestamp, actuals, preds, current_temp))
 
         if run_count % WRITE_EVERY == 0:
             print(f"After {run_count} runs:")
@@ -596,20 +642,13 @@ for i in range(min_start, len(df)):
             print(f"  Max Inference Time: {run_max:.2f} ms")
 
             writer_client.write_points(prediction_points, time_precision='ms')
-
-            last_flushed_ts = prediction_points[-1]["time"]
-            try:
-                save_progress(last_flushed_ts)
-            except Exception as e:
-                print(f"  ⚠️ Could not update progress file {PROGRESS_PATH}: {e}")
-
             prediction_points = []
 
         # Restart process fully to reset TPU state.
         if run_count % RESTART_EVERY == 0:
             print("🧼 Restarting process to fully reset TPU state...")
             print("🧼 Exiting to allow external restart...")
-            sys.exit(88)  # Special exit code recognized by wrapper
+            _exit_restart_for_wrapper()
 
     except Exception as e:
         print(f"⚠️ Exception during Influx write prep at row {i}")
@@ -620,12 +659,6 @@ for i in range(min_start, len(df)):
 # Final flush
 if prediction_points:
     writer_client.write_points(prediction_points, time_precision='ms')
-    # Ensure progress file reflects the last committed prediction
-    last_flushed_ts = prediction_points[-1]["time"]
-    try:
-        save_progress(last_flushed_ts)
-    except Exception as e:
-        print(f"⚠️ Could not update progress file {PROGRESS_PATH} on final flush: {e}")
 
 print("✅ Inference complete.")
 
@@ -638,4 +671,10 @@ if end_ts_dt.tzinfo is None:
 now_utc = pd.Timestamp.now(tz='UTC')
 if end_ts_dt < now_utc - pd.Timedelta(hours=1):
     print(f"📦 Query window ended at {end_ts_dt} (past) — more data may exist. Restarting to fetch next batch...")
-    sys.exit(88)
+    _exit_restart_for_wrapper()
+
+# Use os._exit to bypass Python interpreter shutdown — the EdgeTPU native delegate
+# segfaults during normal teardown.
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(0)

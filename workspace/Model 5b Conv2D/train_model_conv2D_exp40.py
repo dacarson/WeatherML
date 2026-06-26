@@ -6,7 +6,12 @@ KAGGLE_DATASET = "datasets/dacarson/weatherml-training-data"
 # Set to the checkpoint dataset path to resume from a previous Kaggle run, or "" to start fresh.
 # Checkpoints are read from /kaggle/input/{KAGGLE_CHECKPOINT_DATASET}/checkpoints/
 # Example: "datasets/dacarson/weatherml-5b-checkpoints"
-KAGGLE_CHECKPOINT_DATASET = ""  # Exp 38: new architecture — start fresh, no checkpoint resume
+KAGGLE_CHECKPOINT_DATASET = ""  # Exp 40: new experiment — start fresh, no checkpoint resume
+
+# All output files (scalers, TFLite, results JSON, checkpoints) go here.
+# On Kaggle this is /kaggle/working (the standard Kaggle output path).
+# Locally this is an experiment-scoped subdirectory so runs don't overwrite each other.
+RESULTS_DIR = "/kaggle/working" if KAGGLE_MODE else "./results_exp40"
 
 try:
     _register_keras_serializable = tf.keras.saving.register_keras_serializable
@@ -82,6 +87,9 @@ def main():
 
     import os
 
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    print(f"ℹ️  Results directory: {RESULTS_DIR}")
+
     # Asynchronous execution: CPU can prepare next batch while GPU computes current one.
     # Previously forced synchronous for macOS stability, but powermetrics confirmed the GPU
     # was idle ~34% of the time — a clear starvation symptom of the synchronous ping-pong.
@@ -120,19 +128,18 @@ def main():
                 print("ℹ️  GPU memory growth enabled (set GPU_MEMORY_MB=<MB> to cap usage for WindowServer)")
         except RuntimeError as e:
             print(f"⚠️  Could not configure GPU memory: {e}")
-        # For GPU training, balance CPU threads for data loading while GPU computes
-        # GPU cores handle all compute, but CPU needs enough threads to keep GPU fed with data
-        # intra_op: parallelism within CPU operations (data preprocessing, window creation)
-        # inter_op: parallelism between operations (pipeline efficiency, overlap data loading with GPU)
+        # For Metal/GPU training:
+        # intra_op: parallelism within CPU ops (data preprocessing) — more threads help
+        #   keep the GPU fed since data loading is CPU-bound.
+        # inter_op: parallelism between independent TF graph ops — Metal uses a single
+        #   serialized command queue, so multiple inter_op threads compete rather than
+        #   cooperate. Keep at 2 to avoid dispatch contention.
         cores = multiprocessing.cpu_count()
-        # Use more threads for data loading - this is critical for GPU utilization
-        # Data loading/preprocessing is CPU-bound and needs parallelization
-        intra_op_threads = max(4, cores // 2)  # Use half cores for data preprocessing
-        inter_op_threads = max(4, cores // 4)     # Use quarter cores for operation pipelining
+        intra_op_threads = max(4, cores // 2)  # data preprocessing — CPU-bound, benefits from parallelism
+        inter_op_threads = 2                    # Metal: single command queue; >2 causes contention
         tf.config.threading.set_intra_op_parallelism_threads(intra_op_threads)
         tf.config.threading.set_inter_op_parallelism_threads(inter_op_threads)
-        print(f"Using {intra_op_threads} intra_op and {inter_op_threads} inter_op CPU threads (optimized for GPU data loading)")
-        print("Note: More CPU threads help keep GPU fed with data, improving GPU utilization")
+        print(f"Using {intra_op_threads} intra_op and {inter_op_threads} inter_op CPU threads (Metal: low inter_op avoids command queue contention)")
     else:
         print("⚠️  No GPU detected, using CPU")
         cores = multiprocessing.cpu_count()
@@ -190,10 +197,11 @@ def main():
     if KAGGLE_MODE and KAGGLE_CHECKPOINT_DATASET:
         _resume_src = f"/kaggle/input/{KAGGLE_CHECKPOINT_DATASET}/checkpoints"
         if os.path.exists(_resume_src):
-            os.makedirs("./checkpoints", exist_ok=True)
+            _restore_checkpoint_dir = os.path.join(RESULTS_DIR, "checkpoints")
+            os.makedirs(_restore_checkpoint_dir, exist_ok=True)
             for _fname in os.listdir(_resume_src):
-                shutil.copy(os.path.join(_resume_src, _fname), "./checkpoints/")
-            _epoch_file = "./checkpoints/model_latest_epoch.json"
+                shutil.copy(os.path.join(_resume_src, _fname), _restore_checkpoint_dir)
+            _epoch_file = os.path.join(_restore_checkpoint_dir, "model_latest_epoch.json")
             if os.path.exists(_epoch_file):
                 try:
                     with open(_epoch_file) as _f:
@@ -439,30 +447,10 @@ def main():
         val_df['wind_direction_sin'] = np.sin(2 * np.pi * val_df['wind_direction'] / 360.0)
         val_df['wind_direction_cos'] = np.cos(2 * np.pi * val_df['wind_direction'] / 360.0)
 
-    # 1-step temperature delta: current minus previous timestep reading.
-    # Must be computed BEFORE _apply_gap_safety so the gap policy can zero it across gaps.
-    train_df['temp_delta_1'] = train_df['temperature'].diff().fillna(0.0)
-    val_df['temp_delta_1'] = val_df['temperature'].diff().fillna(0.0)
-
-    # Explicit temperature lag features (Exp 26): restore the direct temperature anchors
-    # that Model 5a uses as its #1 and #2 features.  Time-based lookup (not row shift) is
-    # correct here so gaps in the data don't silently pair wrong timestamps.
-    # Rows where the lag timestamp is unavailable within ±90 s become NaN and are dropped
-    # by dropna() below.
-    def _past_temp_at(df: pd.DataFrame, offset: pd.Timedelta, tol: pd.Timedelta) -> np.ndarray:
-        base = pd.DataFrame({"base_time": df.index, "lookup_time": df.index - offset})
-        src  = pd.DataFrame({"src_time": df.index, "temperature": df['temperature'].to_numpy(dtype=np.float32)})
-        merged = pd.merge_asof(base, src, left_on="lookup_time", right_on="src_time",
-                               direction="backward", tolerance=tol)
-        return merged["temperature"].to_numpy(dtype=np.float32)
-
-    _tol = pd.Timedelta(seconds=90)
-    train_df['temp_lag60']  = _past_temp_at(train_df, pd.Timedelta(minutes=60),  _tol)
-    train_df['temp_lag120'] = _past_temp_at(train_df, pd.Timedelta(minutes=120), _tol)
-    train_df['temp_lag180'] = _past_temp_at(train_df, pd.Timedelta(minutes=180), _tol)
-    val_df['temp_lag60']    = _past_temp_at(val_df,   pd.Timedelta(minutes=60),  _tol)
-    val_df['temp_lag120']   = _past_temp_at(val_df,   pd.Timedelta(minutes=120), _tol)
-    val_df['temp_lag180']   = _past_temp_at(val_df,   pd.Timedelta(minutes=180), _tol)
+    # Exp 40: all explicit lag features and temp_delta_1 removed.
+    # The dilated Conv2D (RF ~251 min) can see t-60, t-120, and t-180 directly
+    # in the raw sequence. The anchor path is now purely instantaneous:
+    # current-timestep raw sensors + cyclical encodings + slope features only.
     
 
     # Exp 29: Numba-accelerated rolling linear-regression slopes.
@@ -627,7 +615,10 @@ def main():
     #   Diurnal features are placed after n_conv so only the anchor path sees them.
     #   day_of_year_sin/cos remain — slow annual cycle, not the daily shortcut.
     # Stream B (anchor): last timestep across all n_features — sees diurnal features too.
-    #   Retains direct weight paths for temp_lag60/120/180 and all slope features.
+    #
+    # Exp 40 also removes temp_lag60, temp_lag120, temp_lag180, and temp_delta_1 from
+    #   the anchor path. The dilated Conv2D (RF ~251 min) can see those timesteps in
+    #   the raw sequence; it should learn implicit lag relationships without shortcuts.
     conv_features = [
         'temperature',
         'uv', 'wind_avg', 'wind_gust',
@@ -650,8 +641,6 @@ def main():
     ]
 
     engineered_features = [
-        'temp_delta_1',
-        'temp_lag60', 'temp_lag120', 'temp_lag180',
         'temp_slope_15', 'temp_slope_30', 'temp_slope_60',
         'solar_slope_30', 'humidity_slope_30', 'pressure_slope_60',
     ]
@@ -663,10 +652,6 @@ def main():
     # Domain bounds for raw station features + cyclical encodings
     domain_bounds = {
         "temperature": (-10, 55),
-        "temp_delta_1": (-5, 5),  # 1-min temperature change; ±5°C is a generous bound
-        "temp_lag60":  (-10, 55),
-        "temp_lag120": (-10, 55),
-        "temp_lag180": (-10, 55),
         "temp_slope_15":     (None, None),
         "temp_slope_30":     (None, None),
         "temp_slope_60":     (None, None),
@@ -709,7 +694,7 @@ def main():
         X_val_df[feature] = (X_val_df[feature] - f_min_adj) / (f_max_adj - f_min_adj)
     X_train_flat = X_train_df.values
     X_val_flat = X_val_df.values
-    with open("input_scaler_5b.json", "w") as f:
+    with open(os.path.join(RESULTS_DIR, "input_scaler_5b.json"), "w") as f:
         json.dump(input_scaler, f, indent=2)
 
     # Normalize target values (temperature differences)
@@ -733,7 +718,7 @@ def main():
         val_df[t] = 2.0 * (raw_val_targets[t] - y_min) / (y_max - y_min) - 1.0
 
     # Persist global target scaler (Model 5a format)
-    with open("target_scaler_5b.json", "w") as f:
+    with open(os.path.join(RESULTS_DIR, "target_scaler_5b.json"), "w") as f:
         json.dump({"min": y_min, "max": y_max, "range": (y_min, y_max)}, f, indent=2)
 
     # Per-target keys for inverse scaling (same bounds for all horizons — global scaling above)
@@ -789,9 +774,10 @@ def main():
     
     # Larger batches = more work per GPU call = better GPU utilization.
     # T4/Kaggle: 1024 fills more of the 13.7 GB VRAM per step.
-    # Local Metal: 512 avoids over-committing the shared GPU memory.
-    TRAIN_BATCH_SIZE = 1024 if KAGGLE_MODE else 512
-    VAL_BATCH_SIZE = 1024 if KAGGLE_MODE else 512
+    # Local Metal: 1024 on M1 Pro (16 GB unified) — GPU runs at ~80% at 512 (compute-bound,
+    # not memory-bound), so doubling batch halves step count with minimal memory risk.
+    TRAIN_BATCH_SIZE = 1024
+    VAL_BATCH_SIZE = 1024
 
     
     train_ds = timeseries_dataset_from_array(
@@ -1205,7 +1191,7 @@ def main():
                     
                     # Write hang info to a file for external monitoring
                     try:
-                        with open("training_hang_detected.json", "w") as f:
+                        with open(os.path.join(RESULTS_DIR, "training_hang_detected.json"), "w") as f:
                             json.dump(self.hang_info, f, indent=2)
                     except Exception as e:
                         print(f"⚠️  Could not write hang info: {e}")
@@ -1336,21 +1322,26 @@ def main():
         print(f"\n--- Running: {name} ---\n")
 
         # ---------------------------------------------------------------------
-        # Experiment 40: Two-stream architecture — Conv2D sees physical sensors only.
+        # Experiment 40: Remove diurnal features from Conv2D path + remove explicit
+        # lag features from anchor — let dilated Conv2D learn temporal structure.
         #
-        # Exp 38 established the two-stream design (Conv2D sees raw sensors, anchor
-        # sees all features). Exp 39 added dilated Conv2D for wider receptive field
-        # (~251 min) but Diurnal Dominance persisted: time_of_day_sin2 ranked #1.
+        # Builds on Exp 39's dilated pyramid (RF ~251 min). Two changes vs. Exp 39:
         #
-        # Exp 40 removes diurnal features from the Conv2D slice. They still reach
-        # the anchor path (input[:, -1, :] is over all n_features). Only physical
-        # sensors remain visible to Conv2D, forcing it to learn multi-sensor dynamics
-        # rather than shortcutting on "what time of day is it?"
+        # 1) Diurnal dominance fix: time_of_day_sin/cos/sin2/cos2 removed from Conv2D
+        #    input. Exp 39 feature importance: time_of_day_sin2 ranked #1 — the Conv2D
+        #    was shortcutting on "what time of day is it?" across 180 timesteps instead
+        #    of learning physical sensor dynamics. Diurnal encodings still reach the
+        #    anchor path (input[:, -1, :] covers all n_features).
+        #
+        # 2) Lag removal: temp_lag60, temp_lag120, temp_lag180, temp_delta_1 removed
+        #    from anchor. With 251-min RF the raw sequence already contains t-60/t-120/
+        #    t-180; the Conv2D can learn implicit lag relationships rather than reading
+        #    anchor shortcuts.
         #
         # Stream A — Conv2D path (physical sensors only, no diurnal/lag/slope):
         #   input[:, :, :n_conv] → Reshape(SEQ_LEN, n_conv, 1)
-        #   → Conv2D(96) blocks → GAP → Dense(64) → context(64)
-        # Stream B — Anchor path (full n_features, current timestep):
+        #   → Conv2D(96) dilated blocks → GAP → Dense(64) → context(64)
+        # Stream B — Anchor path (purely instantaneous: raw sensors + diurnal + slopes):
         #   input[:, -1, :] → Dense(32) → ReLU6 → anchor(32)
         # Concatenate([context(64), anchor(32)]) → Dense(32) → ReLU6 → 3 heads
         # ---------------------------------------------------------------------
@@ -1385,13 +1376,13 @@ def main():
             x = tf.keras.layers.BatchNormalization(name="bn_t1")(x)
             x = tf.keras.layers.ReLU(max_value=6.0, name="relu_t1")(x)
 
-            # Block 2: medium temporal patterns (7 timesteps)
-            x = tf.keras.layers.Conv2D(FILTERS, kernel_size=(7, 1), padding='same', use_bias=False, kernel_regularizer=l2(1e-4), name="conv2d_t2")(x)
+            # Block 2: medium temporal patterns — dilation=4 expands RF from 9 → 27 min
+            x = tf.keras.layers.Conv2D(FILTERS, kernel_size=(7, 1), dilation_rate=(4, 1), padding='same', use_bias=False, kernel_regularizer=l2(1e-4), name="conv2d_t2")(x)
             x = tf.keras.layers.BatchNormalization(name="bn_t2")(x)
             x = tf.keras.layers.ReLU(max_value=6.0, name="relu_t2")(x)
 
-            # Block 3: longer temporal patterns (15 timesteps)
-            x = tf.keras.layers.Conv2D(FILTERS, kernel_size=(15, 1), padding='same', use_bias=False, kernel_regularizer=l2(1e-4), name="conv2d_t3")(x)
+            # Block 3: long temporal patterns — dilation=16 expands RF from 23 → ~251 min (~4 hrs)
+            x = tf.keras.layers.Conv2D(FILTERS, kernel_size=(15, 1), dilation_rate=(16, 1), padding='same', use_bias=False, kernel_regularizer=l2(1e-4), name="conv2d_t3")(x)
             x = tf.keras.layers.BatchNormalization(name="bn_t3")(x)
             x = tf.keras.layers.ReLU(max_value=6.0, name="relu_t3")(x)
 
@@ -1449,7 +1440,9 @@ def main():
 
         # Check for existing checkpoints to resume training
         initial_epoch = 0
-        checkpoint_dir = "./checkpoints"
+        # On Kaggle the restore block copies into ./checkpoints/ before training;
+        # locally we use a name-scoped directory so exp38 and exp39 don't collide.
+        checkpoint_dir = os.path.join(RESULTS_DIR, "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)  # Ensure directory exists
         es_state_path = os.path.join(checkpoint_dir, "early_stopping_state.json")
         lr_state_path = os.path.join(checkpoint_dir, "lr_state.json")
@@ -1501,7 +1494,7 @@ def main():
                 checkpoint_to_load = best_weights_checkpoint
                 checkpoint_type = "best_weights"
                 # Try to get epoch from results file
-                results_file = f"results_5b_{name}.json"
+                results_file = os.path.join(RESULTS_DIR, f"results_5b_{name}.json")
                 if os.path.exists(results_file):
                     try:
                         with open(results_file, "r") as f:
@@ -1799,7 +1792,7 @@ def main():
                 # The checkpoint loader above may have loaded the LATEST epoch (e.g., 65)
                 # but we want the BEST epoch (e.g., 46, val_loss=0.001343) as the starting
                 # point for QAT fine-tuning.
-                _best_w = "./checkpoints/best_model.weights.h5"
+                _best_w = os.path.join(checkpoint_dir, "best_model.weights.h5")
                 if os.path.exists(_best_w):
                     model.load_weights(_best_w)
                     print(f"✅ Loaded best float weights from {_best_w} for QAT fine-tuning")
@@ -1836,7 +1829,7 @@ def main():
                 print("   Falling back to PTQ (post-training quantization).")
 
         # patience=30 for Exp 33 float training; 15 for QAT fine-tuning
-        early_stopping = EarlyStopping(monitor='val_task_loss', patience=15 if QAT_ACTIVE else 30, restore_best_weights=True)
+        early_stopping = EarlyStopping(monitor='val_task_loss', patience=15 if QAT_ACTIVE else 30, restore_best_weights=True, mode='min')
 
         # Restore early stopping state across restarts so patience is cumulative.
         # Without this, each restart resets wait=0 and the model gets a fresh
@@ -1857,7 +1850,7 @@ def main():
         # Save best weights checkpoint (for resuming - weights only for smaller size)
         # This is updated every epoch if validation loss improves
         checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
-            filepath="./checkpoints/best_model.weights.h5",  # Fixed filename since save_best_only=True
+            filepath=os.path.join(checkpoint_dir, "best_model.weights.h5"),
             save_weights_only=True,
             save_best_only=True,
             monitor="val_task_loss",
@@ -1868,7 +1861,7 @@ def main():
         # ALSO save best full model as backup (dual backup strategy)
         # This ensures we always have both formats available
         best_full_model_cb = tf.keras.callbacks.ModelCheckpoint(
-            filepath="./checkpoints/best_model_full.weights.h5",
+            filepath=os.path.join(checkpoint_dir, "best_model_full.weights.h5"),
             save_weights_only=True,   # Weights-only avoids optimizer lambda serialization warning
             save_best_only=True,
             monitor="val_task_loss",
@@ -2135,7 +2128,7 @@ def main():
         # Lower = safer (less Metal accumulation); higher = faster (overhead amortised).
         # With screen unlocked / caffeinate -d -i: try 5–10.
         # With screen locked (default macOS GPU power-down): keep at 1.
-        max_epochs_per_run = MaxEpochsPerRun(max_epochs_per_run=9999 if (KAGGLE_MODE or force_cpu) else 1)
+        max_epochs_per_run = MaxEpochsPerRun(max_epochs_per_run=9999 if (KAGGLE_MODE or force_cpu) else 99)
 
         # Match RPi5 configuration exactly
         # Note: The watchdog callback will monitor training and detect hangs
@@ -2200,7 +2193,7 @@ def main():
                     initial_epoch=initial_epoch,
                     steps_per_epoch=train_steps,
                     callbacks=active_callbacks,
-                    verbose=2 if KAGGLE_MODE else 1,
+                    verbose=2,  # one line per epoch; verbose=1 wastes I/O on 1025 progress bar updates
                 )
             except KeyboardInterrupt as e:
                 # Check if this was triggered by the watchdog
@@ -2383,7 +2376,7 @@ def main():
                 else:
                     raise
 
-        tflite_fname = f"weather_model_5b_quant_{name}.tflite"
+        tflite_fname = os.path.join(RESULTS_DIR, f"weather_model_5b_quant_{name}.tflite")
         with open(tflite_fname, "wb") as f:
             f.write(quantized_tflite_model)
 
@@ -2414,7 +2407,7 @@ def main():
             session_history = {k: [float(v) for v in vals]
                                for k, vals in history.history.items()}
 
-        results_path = f"results_5b_{name}.json"
+        results_path = os.path.join(RESULTS_DIR, f"results_5b_{name}.json")
         accumulated_history = {}
         if os.path.exists(results_path):
             try:
@@ -2440,7 +2433,7 @@ def main():
 
     # Configuration
     NUM_RUNS = 1  # Number of training runs to perform
-    EXP_NAME = "conv2d_exp38"
+    EXP_NAME = "conv2d_exp40"
     for run_id in range(NUM_RUNS):
         run_name = f"{EXP_NAME}_run{run_id+1}"
         build_and_train_model(run_name)
@@ -2448,7 +2441,7 @@ def main():
     results = []
     # Only collect results from the current run session
     for run_id in range(NUM_RUNS):
-        json_file = f"results_5b_{EXP_NAME}_run{run_id+1}.json"
+        json_file = os.path.join(RESULTS_DIR, f"results_5b_{EXP_NAME}_run{run_id+1}.json")
         if os.path.exists(json_file):
             with open(json_file, "r") as f:
                 metrics = json.load(f)
@@ -2463,16 +2456,16 @@ def main():
 
     # Copy best model to canonical filename
     import shutil
-    best_model_file = f"weather_model_5b_quant_{best['name']}.tflite"
-    shutil.copy(best_model_file, "weather_model_5b_best.tflite")
-    print(f"Best model copied to: weather_model_5b_best.tflite")
+    best_model_file = os.path.join(RESULTS_DIR, f"weather_model_5b_quant_{best['name']}.tflite")
+    shutil.copy(best_model_file, os.path.join(RESULTS_DIR, "weather_model_5b_best.tflite"))
+    print(f"Best model copied to: {os.path.join(RESULTS_DIR, 'weather_model_5b_best.tflite')}")
     
     # Validate the best quantized model
     print("\n" + "="*50)
     print("VALIDATING BEST QUANTIZED MODEL")
     print("="*50)
     y_val_array = y_val_small
-    validate_quantized_model("weather_model_5b_best.tflite", X_val_small, y_val_array, y_mins, y_maxs)
+    validate_quantized_model(os.path.join(RESULTS_DIR, "weather_model_5b_best.tflite"), X_val_small, y_val_array, y_mins, y_maxs)
 
 # --- Validate quantized TFLite model on validation data ---
 def validate_quantized_model(tflite_model_path, X_val, y_val, y_mins, y_maxs, num_samples=500):

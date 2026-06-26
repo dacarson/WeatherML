@@ -45,9 +45,30 @@ class ExtractLagLayer(tf.keras.layers.Layer):
     def from_config(cls, config):
         return cls(**config)
 
+class SliceTimestep(tf.keras.layers.Layer):
+    def __init__(self, index, **kwargs):
+        super().__init__(**kwargs)
+        self.index = index
+    def call(self, x):
+        return x[:, self.index, :]
+    def get_config(self):
+        return {**super().get_config(), "index": self.index}
+
+class SliceFeatures(tf.keras.layers.Layer):
+    def __init__(self, start, end, **kwargs):
+        super().__init__(**kwargs)
+        self.start = start
+        self.end = end
+    def call(self, x):
+        return x[:, :, self.start:self.end]
+    def get_config(self):
+        return {**super().get_config(), "start": self.start, "end": self.end}
+
 # Custom objects for loading the model
 CUSTOM_OBJECTS = {
-    'ExtractLagLayer': ExtractLagLayer
+    'ExtractLagLayer': ExtractLagLayer,
+    'SliceTimestep': SliceTimestep,
+    'SliceFeatures': SliceFeatures,
 }
 
 def load_training_data_for_quantization():
@@ -135,13 +156,15 @@ def main():
     
     # Find the best model checkpoint
     checkpoint_dir = "./checkpoints"
-    best_model_path = os.path.join(checkpoint_dir, "best_model_full.h5")
-    
+    # Specify which checkpoint to convert. Change this to use a different epoch.
+    target_checkpoint = os.environ.get("CHECKPOINT", "model_epoch_60.h5")
+    best_model_path = os.path.join(checkpoint_dir, target_checkpoint)
+
     if not os.path.exists(best_model_path):
-        print(f"❌ Error: Best model not found at {best_model_path}")
+        print(f"❌ Error: Checkpoint not found at {best_model_path}")
         print("Available checkpoints:")
-        for f in glob.glob(os.path.join(checkpoint_dir, "*.h5")):
-            print(f"  - {f}")
+        for f in sorted(glob.glob(os.path.join(checkpoint_dir, "*.h5"))):
+            print(f"  - {os.path.basename(f)}")
         sys.exit(1)
     
     print(f"✅ Found best model: {best_model_path}")
@@ -169,18 +192,73 @@ def main():
     X_train_flat, features = load_training_data_for_quantization()
     print(f"✅ Loaded training data: {X_train_flat.shape}")
     
-    # Ensure model is in inference mode
-    print("\nPreparing model for conversion...")
-    dummy_input = tf.zeros((1, seq_len, n_features), dtype=tf.float32)
-    _ = model(dummy_input, training=False)
-    
+    # Build a fresh float32 model and copy weights from the loaded (possibly mixed-precision)
+    # checkpoint. This is required because mixed_float16 embeds Cast(f16) ops inside every
+    # layer — converting that model directly to TFLite leaves all internal ops as f16, which
+    # the TFLite converter rejects. A fresh float32 model has no Cast ops.
+    print("\n🔧 Building float32 export model for TFLite conversion...")
+    tf.keras.mixed_precision.set_global_policy('float32')
+
+    def build_export_model():
+        # Exp 24 architecture: equal 64-filter branches, no MSB blocks, smaller dense head
+        inp = tf.keras.layers.Input(shape=(seq_len, n_features), name="input")
+        MAIN_F = 64
+        TEMP_F = 64
+
+        m = tf.keras.layers.Conv1D(MAIN_F, 3, padding='causal', use_bias=False, name="main_conv_init")(inp)
+        m = tf.keras.layers.BatchNormalization(name="main_bn_init")(m)
+        m = tf.keras.layers.ReLU(name="main_relu_init")(m)
+        for d in [1, 2, 4, 8, 16, 32, 64]:
+            r = m
+            m = tf.keras.layers.Conv1D(MAIN_F, 3, padding='causal', dilation_rate=d, use_bias=False, name=f"main_conv_d{d}")(m)
+            m = tf.keras.layers.BatchNormalization(name=f"main_bn_d{d}")(m)
+            m = tf.keras.layers.ReLU(name=f"main_relu_d{d}")(m)
+            m = tf.keras.layers.Add(name=f"main_add_d{d}")([r, m])
+
+        temp_input = SliceFeatures(0, 2, name="temp_branch_slice")(inp)
+        t = tf.keras.layers.Conv1D(TEMP_F, 3, padding='causal', use_bias=False, name="temp_conv_init")(temp_input)
+        t = tf.keras.layers.BatchNormalization(name="temp_bn_init")(t)
+        t = tf.keras.layers.ReLU(name="temp_relu_init")(t)
+        for d in [1, 2, 4, 8, 16, 32, 64]:
+            r = t
+            t = tf.keras.layers.Conv1D(TEMP_F, 3, padding='causal', dilation_rate=d, use_bias=False, name=f"temp_conv_d{d}")(t)
+            t = tf.keras.layers.BatchNormalization(name=f"temp_bn_d{d}")(t)
+            t = tf.keras.layers.ReLU(name=f"temp_relu_d{d}")(t)
+            t = tf.keras.layers.Add(name=f"temp_add_d{d}")([r, t])
+
+        x = tf.keras.layers.Concatenate(name="temporal_concat")([
+            SliceTimestep(-1,   name="main_extract_t0")(m),
+            SliceTimestep(-31,  name="main_extract_t30")(m),
+            SliceTimestep(-61,  name="main_extract_t60")(m),
+            SliceTimestep(-121, name="main_extract_t120")(m),
+            SliceTimestep(-1,   name="temp_extract_t0")(t),
+            SliceTimestep(-31,  name="temp_extract_t30")(t),
+            SliceTimestep(-61,  name="temp_extract_t60")(t),
+            SliceTimestep(-121, name="temp_extract_t120")(t),
+        ])
+        x = tf.keras.layers.Dense(128, use_bias=False, name="dense1")(x)
+        x = tf.keras.layers.ReLU(name="relu_dense1")(x)
+        x = tf.keras.layers.Dropout(0.3, name="dropout")(x)
+        x = tf.keras.layers.Dense(64, use_bias=False, name="dense2")(x)
+        x = tf.keras.layers.ReLU(name="relu_dense2")(x)
+        x = tf.keras.layers.BatchNormalization(name="bn_dense2")(x)
+        o1 = tf.keras.layers.Dense(1, activation='linear', use_bias=False, dtype='float32', name='diff_1hr')(x)
+        o2 = tf.keras.layers.Dense(1, activation='linear', use_bias=False, dtype='float32', name='diff_2hr')(x)
+        o3 = tf.keras.layers.Dense(1, activation='linear', use_bias=False, dtype='float32', name='diff_3hr')(x)
+        return tf.keras.Model(inputs=inp, outputs=[o1, o2, o3])
+
+    export_model = build_export_model()
+    export_model(tf.zeros((1, seq_len, n_features), dtype=tf.float32), training=False)
+    export_model.set_weights(model.get_weights())
+    print("✅ Float32 export model built and weights copied")
+
     # Create concrete function with fixed input signature (batch_size=1)
     # This ensures all tensor shapes are static, which Edge TPU requires
     print("Creating concrete function with fixed batch size...")
     @tf.function(input_signature=[tf.TensorSpec(shape=[1, seq_len, n_features], dtype=tf.float32)])
     def model_inference(x):
-        return model(x, training=False)
-    
+        return export_model(x, training=False)
+
     concrete_func = model_inference.get_concrete_function()
     
     # Create TFLite converter
