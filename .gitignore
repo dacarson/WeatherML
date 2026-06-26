@@ -9,6 +9,7 @@ workspace/*/checkpoints/
 
 # Large training/validation data files (regenerate with export_influx_to_csv*.py)
 workspace/*.csv
+workspace/*.csv.zip
 !workspace/fold_metrics.csv
 
 # Per-location data subdirectories
