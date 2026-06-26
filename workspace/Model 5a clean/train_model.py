@@ -38,9 +38,68 @@ def main():
     import glob
     from numba import njit, prange
 
+    def _invalidate_targets_crossing_gaps(df, label, tol_s=90):
+        """Null pre-computed target values whose future lookup crosses a time gap.
+
+        CSV columns temp_t+1hr/2hr/3hr are populated from InfluxDB at export time.
+        Rows before a sensor outage have targets pointing into the post-gap glitch
+        window; those rows survive with normal timestamps and are not caught by any
+        gap-row drop.  Nulling them here lets the subsequent dropna() remove them.
+        """
+        if not isinstance(df.index, pd.DatetimeIndex):
+            return df
+
+        target_horizons = {60: "temp_t+1hr", 120: "temp_t+2hr", 180: "temp_t+3hr"}
+        present = {h: c for h, c in target_horizons.items() if c in df.columns}
+        if not present:
+            return df
+
+        dt_s = df.index.to_series().diff().dt.total_seconds()
+        gap_positions = np.flatnonzero((dt_s > float(tol_s)).to_numpy())
+        if gap_positions.size == 0:
+            print(f"\n✅ {label}: no cross-gap target contamination detected")
+            return df
+
+        df = df.copy()
+        n_nulled = 0
+
+        for pos in gap_positions:
+            if pos == 0:
+                continue
+            gap_boundary = df.index[pos - 1]
+            for h_min, col in present.items():
+                cutoff = gap_boundary - pd.Timedelta(minutes=h_min)
+                mask = (df.index > cutoff) & (df.index <= gap_boundary)
+                n = int(mask.sum())
+                if n > 0:
+                    df.loc[mask, col] = np.nan
+                    n_nulled += n
+
+        if n_nulled > 0:
+            print(f"\n⚠️  {label}: nulled {n_nulled} cross-gap target lookups across "
+                  f"{gap_positions.size} gap(s) — will be removed by dropna()")
+        else:
+            print(f"\n✅ {label}: no cross-gap target contamination detected")
+
+        return df
+
     # Load preprocessed data
     train_df = pd.read_csv("../train_data_sf.csv")
     val_df = pd.read_csv("../val_data_sf.csv")
+
+    # Set DatetimeIndex from the exported Unix-second timestamp column so that
+    # gap detection in _invalidate_targets_crossing_gaps works correctly.
+    if 'timestamp' in train_df.columns:
+        train_df.index = pd.to_datetime(train_df['timestamp'], unit='s', utc=True)
+    if 'timestamp' in val_df.columns:
+        val_df.index = pd.to_datetime(val_df['timestamp'], unit='s', utc=True)
+
+    # Null target values that reference post-gap (potentially glitched) InfluxDB data.
+    # Must run before diff computation so corrupted targets never enter training targets.
+    # tol_s=600: only invalidate around real outages (10+ min gaps); the 9000+ single
+    # missed-minute readings in the dataset do NOT corrupt forward-looking targets.
+    train_df = _invalidate_targets_crossing_gaps(train_df, "train_df", tol_s=600)
+    val_df   = _invalidate_targets_crossing_gaps(val_df,   "val_df",   tol_s=600)
 
     # Add lag features (30 minutes ago) using np.roll for lag, set first 30 entries to np.nan
     def lag_feature(arr, lag):
@@ -73,18 +132,15 @@ def main():
     val_df['uv_lag30'] = lag_feature(val_df['uv'].values, 30)
     val_df['pressure_lag30'] = lag_feature(val_df['station_pressure'].values, 30)
 
-    # Enhanced cyclical encoding for time_of_day to better capture daily patterns
-    # Convert time_of_day (0-24 hours) to sine and cosine components
-    train_df['time_of_day_sin'] = np.sin(2 * np.pi * train_df['time_of_day'] / 24.0)
-    train_df['time_of_day_cos'] = np.cos(2 * np.pi * train_df['time_of_day'] / 24.0)
-    val_df['time_of_day_sin'] = np.sin(2 * np.pi * val_df['time_of_day'] / 24.0)
-    val_df['time_of_day_cos'] = np.cos(2 * np.pi * val_df['time_of_day'] / 24.0)
-    
-    # Add higher-order cyclical components for more complex daily patterns
-    train_df['time_of_day_sin2'] = np.sin(4 * np.pi * train_df['time_of_day'] / 24.0)
-    train_df['time_of_day_cos2'] = np.cos(4 * np.pi * train_df['time_of_day'] / 24.0)
-    val_df['time_of_day_sin2'] = np.sin(4 * np.pi * val_df['time_of_day'] / 24.0)
-    val_df['time_of_day_cos2'] = np.cos(4 * np.pi * val_df['time_of_day'] / 24.0)
+    # Exp 8: time_of_day features removed to force model to learn from physical lag features.
+    # train_df['time_of_day_sin'] = np.sin(2 * np.pi * train_df['time_of_day'] / 24.0)
+    # train_df['time_of_day_cos'] = np.cos(2 * np.pi * train_df['time_of_day'] / 24.0)
+    # val_df['time_of_day_sin'] = np.sin(2 * np.pi * val_df['time_of_day'] / 24.0)
+    # val_df['time_of_day_cos'] = np.cos(2 * np.pi * val_df['time_of_day'] / 24.0)
+    # train_df['time_of_day_sin2'] = np.sin(4 * np.pi * train_df['time_of_day'] / 24.0)
+    # train_df['time_of_day_cos2'] = np.cos(4 * np.pi * train_df['time_of_day'] / 24.0)
+    # val_df['time_of_day_sin2'] = np.sin(4 * np.pi * val_df['time_of_day'] / 24.0)
+    # val_df['time_of_day_cos2'] = np.cos(4 * np.pi * val_df['time_of_day'] / 24.0)
 
     # Add cyclical encoding for day_of_year to better capture seasonal patterns
     # Convert day_of_year (1-365) to sine and cosine components
@@ -182,7 +238,6 @@ def main():
         'solar_radiation', 'illuminance',
         'relative_humidity', 'station_pressure',
         'day_of_year_sin', 'day_of_year_cos',
-        'time_of_day_sin', 'time_of_day_cos', 'time_of_day_sin2', 'time_of_day_cos2',
         'temp_lag30', 'humidity_lag30', 'temp_lag60', 'humidity_lag60', 'temp_lag120', 'humidity_lag120',
         'wind_avg_lag30', 'wind_gust_lag30', 'uv_lag30', 'pressure_lag30'
     ]
@@ -213,10 +268,6 @@ def main():
         "temp_lag30": (-10, 55),
         "day_of_year_sin": (-1, 1),         # Sine component naturally bounded [-1, 1]
         "day_of_year_cos": (-1, 1),         # Cosine component naturally bounded [-1, 1]
-        "time_of_day_sin": (-1, 1),         # Sine component naturally bounded [-1, 1]
-        "time_of_day_cos": (-1, 1),         # Cosine component naturally bounded [-1, 1]
-        "time_of_day_sin2": (-1, 1),        # Higher-order sine component
-        "time_of_day_cos2": (-1, 1),        # Higher-order cosine component
         "wind_direction_sin": (-1, 1),      # Wind direction sine component (cyclical 0-360°)
         "wind_direction_cos": (-1, 1),      # Wind direction cosine component (cyclical 0-360°)
         "wind_lull": (0, None),             # Minimum wind speed
@@ -403,15 +454,23 @@ def main():
         # Input is a full (time, feature) sequence
         input_layer = tf.keras.layers.Input(shape=(SEQ_LEN, n_features), name="input")
 
-        # Flatten the entire sequence (all timesteps and features) into one wide vector
-        # This allows the dense layers to learn Conv2D-like patterns over the full window.
-        flat = tf.keras.layers.Reshape((SEQ_LEN * n_features,), name="flatten_sequence")(input_layer)
+        # Stage 1: temporal pooling — 180 timesteps → 30 using 6-minute averaging.
+        # AveragePooling1D generates AVERAGE_POOL_2D (EdgeTPU v1, fully supported).
+        # Avoids Dense on 3D input which generates FULLY_CONNECTED version 9 (not supported).
+        pooled = tf.keras.layers.AveragePooling1D(pool_size=6, strides=6, name='temporal_pool')(input_layer)
 
-        # Learn feature interactions automatically (Edge TPU compatible)
-        interaction_projection = build_feature_interaction_path(flat, embedding_dim=16, projection_dim=32)
-        
-        wide = tf.keras.layers.Dense(16, use_bias=False, name="wide_dense")(flat)
-        deep = tf.keras.layers.Dense(128, activation='relu', use_bias=False, name="deep_dense1")(flat)
+        # Stage 2: flatten pooled sequence — 30 × n_features ≈ 810 dims (below ~1660 SRAM threshold).
+        # Explicit Reshape (not Flatten) required: Flatten emits two -1 dims which TF can't trace.
+        flat = tf.keras.layers.Reshape(((SEQ_LEN // 6) * n_features,), name='flatten_sequence')(pooled)
+
+        # Stage 3: single shared bottleneck on the now-small flat vector
+        bottleneck = tf.keras.layers.Dense(64, activation='relu', use_bias=False, name='bottleneck')(flat)
+
+        # All downstream branches use the 64-dim bottleneck
+        interaction_projection = build_feature_interaction_path(bottleneck, embedding_dim=16, projection_dim=32)
+
+        wide = tf.keras.layers.Dense(16, use_bias=False, name="wide_dense")(bottleneck)
+        deep = tf.keras.layers.Dense(128, activation='relu', use_bias=False, name="deep_dense1")(bottleneck)
         deep = tf.keras.layers.Dropout(0.3, name="deep_dropout")(deep)
 
         res = tf.keras.layers.Dense(64, activation='relu', use_bias=False, name="deep_res_dense1")(deep)
@@ -428,8 +487,7 @@ def main():
         output_3 = tf.keras.layers.Dense(1, activation='linear', use_bias=False, name='diff_3hr')(merged)
         model = tf.keras.Model(inputs=input_layer, outputs=[output_1, output_2, output_3])
 
-        # Optimized optimizer for Mac M1
-        optimizer = tf.keras.optimizers.Adam(learning_rate=1e-5)
+        optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
         model.compile(
             optimizer=optimizer,
             loss='mse',
@@ -441,7 +499,7 @@ def main():
         )
         model.summary()
 
-        early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+        early_stopping = EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True)
         checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
             filepath="./checkpoints/model_{epoch:02d}.weights.h5",
             save_weights_only=True,
@@ -449,13 +507,15 @@ def main():
             monitor="val_loss",
             mode="min"
         )
+        reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss', factor=0.5, patience=8, min_lr=1e-7, verbose=1
+        )
 
-        # Match RPi5 configuration exactly
         history = model.fit(
             train_ds,
             validation_data=val_ds,
             epochs=100,
-            callbacks=[early_stopping, checkpoint_cb]
+            callbacks=[early_stopping, checkpoint_cb, reduce_lr]
         )
 
         # The early stopping callback with restore_best_weights=True already restored the best weights
@@ -559,13 +619,13 @@ def main():
     # Configuration
     NUM_RUNS = 1  # Number of training runs to perform
     for run_id in range(NUM_RUNS):
-        run_name = f"dense_wide_run{run_id+1}"
+        run_name = f"no_tod_run{run_id+1}"
         build_and_train_model(run_name)
 
     results = []
     # Only collect results from the current run session
     for run_id in range(NUM_RUNS):
-        json_file = f"results_5a_dense_wide_run{run_id+1}.json"
+        json_file = f"results_5a_no_tod_run{run_id+1}.json"
         if os.path.exists(json_file):
             with open(json_file, "r") as f:
                 metrics = json.load(f)

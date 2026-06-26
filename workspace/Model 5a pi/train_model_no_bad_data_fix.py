@@ -13,9 +13,11 @@ def main():
     cores = multiprocessing.cpu_count()
     print(f"Setting TensorFlow threads → {cores} cores")
 
-    # Force TensorFlow to use all CPU threads
+    # intra_op: threads used within a single op (matrix multiply, etc.) — use all cores
+    # inter_op: ops allowed to run concurrently — keep at 1 for sequential batch training
+    #   so all cores stay focused on one op at a time instead of splitting across ops.
     tf.config.threading.set_intra_op_parallelism_threads(cores)
-    tf.config.threading.set_inter_op_parallelism_threads(cores)
+    tf.config.threading.set_inter_op_parallelism_threads(1)
     tf.config.set_soft_device_placement(True)
 
     # Optional confirmation
@@ -38,143 +40,226 @@ def main():
     import glob
     from numba import njit, prange
 
-    # Load preprocessed data
-    train_df = pd.read_csv("../train_data_sf.csv")
-    val_df = pd.read_csv("../val_data_sf.csv")
+    # Configuration
+    TRAIN_VAL_SPLIT_RATIO = 0.5  # 0.5 = 50/50 split, 0.7 = 70/30 split
+    MIN_SAMPLES_PER_SET = 1000   # Minimum samples required for each set
+    BATCH_SIZE = 50000           # Load data in batches to manage memory
+    MAX_MEMORY_MB = 2000         # Maximum memory usage (2GB)
 
-    # Add lag features (30 minutes ago) using np.roll for lag, set first 30 entries to np.nan
+    # Connect to InfluxDB and load live data
+    from influxdb import InfluxDBClient
+    import datetime
+
+    print("Connecting to InfluxDB...")
+    client = InfluxDBClient(
+        host="10.0.1.188",
+        port=8086,
+        username="admin",
+        password="24planet",
+        database="ps_smartweather"
+    )
+
+    print("Loading full dataset from InfluxDB with batched queries...")
+    print("Checking InfluxDB connection and data availability...")
+
+    measurements_result = client.query('SHOW MEASUREMENTS')
+    measurements = list(measurements_result.get_points())
+    print(f"Available measurements: {[m['name'] for m in measurements]}")
+
+    target_measurement = "wf/obs_st"
+    measurement_names = [m['name'] for m in measurements]
+    if target_measurement not in measurement_names:
+        print(f"❌ Measurement '{target_measurement}' not found!")
+        for m in measurements:
+            print(f"  - {m['name']}")
+        raise ValueError(f"Target measurement '{target_measurement}' not found in database")
+
+    print(f"Getting data time range from '{target_measurement}'...")
+    time_result = client.query(f'SELECT MIN(time) as min_time, MAX(time) as max_time FROM "{target_measurement}"')
+    time_points = list(time_result.get_points())
+
+    if not time_points:
+        print("❌ No time range data returned. Checking for any data...")
+        test_points = list(client.query(f'SELECT * FROM "{target_measurement}" LIMIT 1').get_points())
+        if not test_points:
+            raise ValueError(f"No data found in measurement '{target_measurement}'.")
+        try:
+            first_points = list(client.query(f'SELECT time, temperature FROM "{target_measurement}" ORDER BY time ASC LIMIT 1').get_points())
+            last_points = list(client.query(f'SELECT time, temperature FROM "{target_measurement}" ORDER BY time DESC LIMIT 1').get_points())
+            if first_points and last_points:
+                min_time = first_points[0]['time']
+                max_time = last_points[0]['time']
+                print(f"✅ Time range (alternative): {min_time} to {max_time}")
+            else:
+                min_time = max_time = test_points[0]['time']
+        except Exception as e:
+            print(f"Alternative time range query failed: {e}")
+            min_time = max_time = test_points[0]['time']
+    else:
+        min_time = time_points[0]['min_time']
+        max_time = time_points[0]['max_time']
+        print(f"✅ Time range: {min_time} to {max_time}")
+
+    print("Getting total data count...")
+    total_count = None
+    for count_query in [
+        f'SELECT COUNT(temperature) FROM "{target_measurement}"',
+        f'SELECT COUNT(*) FROM "{target_measurement}"',
+    ]:
+        try:
+            count_points = list(client.query(count_query).get_points())
+            if count_points:
+                for key, value in count_points[0].items():
+                    if isinstance(value, (int, float)) and value > 0:
+                        total_count = int(value)
+                        break
+            if total_count:
+                break
+        except Exception:
+            continue
+    if not total_count:
+        total_count = len(list(client.query(f'SELECT * FROM "{target_measurement}" LIMIT 1000').get_points()))
+        print(f"⚠️  Using sample-based estimate: {total_count}")
+    else:
+        print(f"✅ Total data points: {total_count:,}")
+
+    # InfluxDB's max-select-point limit applies per shard, not per query result.
+    # LIMIT N doesn't help — InfluxDB counts scanned points before applying LIMIT.
+    # At 1-min intervals with weekly shards, even a small LIMIT scans an entire shard.
+    # Fix: use time-window queries (WHERE time >= start AND time < end) so each query
+    # only touches the shards that overlap with the window.
+    needed_fields = {
+        'temperature', 'relative_humidity', 'wind_avg', 'wind_gust',
+        'uv', 'station_pressure', 'solar_radiation', 'illuminance',
+        'wind_direction', 'wind_lull', 'rain_accumulated',
+    }
+    field_keys_result = client.query(f'SHOW FIELD KEYS FROM "{target_measurement}"')
+    available_fields = [f['fieldKey'] for f in field_keys_result.get_points()]
+    select_fields = [f for f in available_fields if f in needed_fields]
+    if not select_fields:
+        raise ValueError(f"None of the required fields found in '{target_measurement}'. Available: {available_fields}")
+    print(f"Selecting {len(select_fields)} fields: {select_fields}")
+
+    # Calculate window size: stay under 90k points (90% of 100k limit)
+    # 1440 minutes/day × num_fields points/minute
+    points_per_day = 1440 * len(select_fields)
+    window_days = max(1, int(90000 / points_per_day))
+    print(f"Using {window_days}-day time windows (~{window_days * points_per_day:,} points/window)")
+
+    select_clause = ', '.join(f'"{f}"' for f in select_fields)
+    window = datetime.timedelta(days=window_days)
+
+    # Parse the time range obtained earlier
+    range_start = pd.to_datetime(min_time).to_pydatetime().replace(tzinfo=datetime.timezone.utc)
+    range_end   = pd.to_datetime(max_time).to_pydatetime().replace(tzinfo=datetime.timezone.utc)
+
+    batch_dfs = []
+    win_start = range_start
+    while win_start <= range_end:
+        win_end = win_start + window
+        start_str = win_start.strftime('%Y-%m-%dT%H:%M:%SZ')
+        end_str   = win_end.strftime('%Y-%m-%dT%H:%M:%SZ')
+        batch_query = (
+            f'SELECT {select_clause} FROM "{target_measurement}"'
+            f' WHERE time >= \'{start_str}\' AND time < \'{end_str}\''
+            f' ORDER BY time ASC'
+        )
+        batch_points = list(client.query(batch_query).get_points())
+        if batch_points:
+            # Convert to DataFrame immediately — much lower memory than accumulating
+            # a list of Python dicts (dicts use ~10× more memory than a DataFrame).
+            batch_df = pd.DataFrame(batch_points)
+            batch_df['time'] = pd.to_datetime(batch_df['time'])
+            batch_df.set_index('time', inplace=True)
+            # Cast float64 → float32 now to halve memory
+            batch_df = batch_df.astype({c: np.float32 for c in batch_df.select_dtypes('float64').columns})
+            batch_dfs.append(batch_df)
+            del batch_points, batch_df
+            total_so_far = sum(len(d) for d in batch_dfs)
+            print(f"  {start_str} → {end_str}: loaded (total: {total_so_far:,})")
+        win_start = win_end
+
+    if not batch_dfs:
+        raise ValueError("No data loaded from InfluxDB.")
+
+    print(f"Concatenating {len(batch_dfs)} batches...")
+    df = pd.concat(batch_dfs)
+    del batch_dfs
+    import gc; gc.collect()
+    print(f"✅ Successfully loaded {len(df):,} data points")
+
+    # Derived time features
+    df['day_of_year'] = df.index.dayofyear
+    df['time_of_day'] = df.index.hour + df.index.minute / 60.0
+
+    # Lag features on the full dataset (before splitting avoids boundary artifacts)
     def lag_feature(arr, lag):
         arr = np.asarray(arr)
         lagged = np.roll(arr, lag)
         lagged[:lag] = np.nan
         return lagged
-    train_df['temp_lag30'] = lag_feature(train_df['temperature'].values, 30)
-    train_df['humidity_lag30'] = lag_feature(train_df['relative_humidity'].values, 30)
-    val_df['temp_lag30'] = lag_feature(val_df['temperature'].values, 30)
-    val_df['humidity_lag30'] = lag_feature(val_df['relative_humidity'].values, 30)
-    
-    # Additional lag features for multiple time horizons
-    train_df['temp_lag60'] = lag_feature(train_df['temperature'].values, 60)   # 1 hour ago
-    train_df['temp_lag120'] = lag_feature(train_df['temperature'].values, 120) # 2 hours ago
-    train_df['humidity_lag60'] = lag_feature(train_df['relative_humidity'].values, 60)   # 1 hour ago
-    train_df['humidity_lag120'] = lag_feature(train_df['relative_humidity'].values, 120) # 2 hours ago
-    val_df['temp_lag60'] = lag_feature(val_df['temperature'].values, 60)
-    val_df['temp_lag120'] = lag_feature(val_df['temperature'].values, 120)
-    val_df['humidity_lag60'] = lag_feature(val_df['relative_humidity'].values, 60)
-    val_df['humidity_lag120'] = lag_feature(val_df['relative_humidity'].values, 120)
-    
-    # Add more environmental lag features (wind, UV, pressure)
-    train_df['wind_avg_lag30'] = lag_feature(train_df['wind_avg'].values, 30)
-    train_df['wind_gust_lag30'] = lag_feature(train_df['wind_gust'].values, 30)
-    train_df['uv_lag30'] = lag_feature(train_df['uv'].values, 30)
-    train_df['pressure_lag30'] = lag_feature(train_df['station_pressure'].values, 30)
-    val_df['wind_avg_lag30'] = lag_feature(val_df['wind_avg'].values, 30)
-    val_df['wind_gust_lag30'] = lag_feature(val_df['wind_gust'].values, 30)
-    val_df['uv_lag30'] = lag_feature(val_df['uv'].values, 30)
-    val_df['pressure_lag30'] = lag_feature(val_df['station_pressure'].values, 30)
 
-    # Enhanced cyclical encoding for time_of_day to better capture daily patterns
-    # Convert time_of_day (0-24 hours) to sine and cosine components
-    train_df['time_of_day_sin'] = np.sin(2 * np.pi * train_df['time_of_day'] / 24.0)
-    train_df['time_of_day_cos'] = np.cos(2 * np.pi * train_df['time_of_day'] / 24.0)
-    val_df['time_of_day_sin'] = np.sin(2 * np.pi * val_df['time_of_day'] / 24.0)
-    val_df['time_of_day_cos'] = np.cos(2 * np.pi * val_df['time_of_day'] / 24.0)
-    
-    # Add higher-order cyclical components for more complex daily patterns
-    train_df['time_of_day_sin2'] = np.sin(4 * np.pi * train_df['time_of_day'] / 24.0)
-    train_df['time_of_day_cos2'] = np.cos(4 * np.pi * train_df['time_of_day'] / 24.0)
-    val_df['time_of_day_sin2'] = np.sin(4 * np.pi * val_df['time_of_day'] / 24.0)
-    val_df['time_of_day_cos2'] = np.cos(4 * np.pi * val_df['time_of_day'] / 24.0)
+    df['temp_lag30'] = lag_feature(df['temperature'].values, 30)
+    df['temp_lag60'] = lag_feature(df['temperature'].values, 60)
+    df['temp_lag120'] = lag_feature(df['temperature'].values, 120)
+    df['humidity_lag30'] = lag_feature(df['relative_humidity'].values, 30)
+    df['humidity_lag60'] = lag_feature(df['relative_humidity'].values, 60)
+    df['humidity_lag120'] = lag_feature(df['relative_humidity'].values, 120)
+    df['wind_avg_lag30'] = lag_feature(df['wind_avg'].values, 30)
+    df['wind_gust_lag30'] = lag_feature(df['wind_gust'].values, 30)
+    df['uv_lag30'] = lag_feature(df['uv'].values, 30)
+    df['pressure_lag30'] = lag_feature(df['station_pressure'].values, 30)
 
-    # Add cyclical encoding for day_of_year to better capture seasonal patterns
-    # Convert day_of_year (1-365) to sine and cosine components
-    train_df['day_of_year_sin'] = np.sin(2 * np.pi * train_df['day_of_year'] / 365.25)
-    train_df['day_of_year_cos'] = np.cos(2 * np.pi * train_df['day_of_year'] / 365.25)
-    val_df['day_of_year_sin'] = np.sin(2 * np.pi * val_df['day_of_year'] / 365.25)
-    val_df['day_of_year_cos'] = np.cos(2 * np.pi * val_df['day_of_year'] / 365.25)
-    
-    # Add cyclical encoding for wind_direction (0-360 degrees) - very useful for local weather patterns
-    # Wind direction affects temperature (e.g., onshore vs offshore winds, prevailing winds)
-    if 'wind_direction' in train_df.columns:
-        train_df['wind_direction_sin'] = np.sin(2 * np.pi * train_df['wind_direction'] / 360.0)
-        train_df['wind_direction_cos'] = np.cos(2 * np.pi * train_df['wind_direction'] / 360.0)
-        val_df['wind_direction_sin'] = np.sin(2 * np.pi * val_df['wind_direction'] / 360.0)
-        val_df['wind_direction_cos'] = np.cos(2 * np.pi * val_df['wind_direction'] / 360.0)
-    
+    # Cyclical encoding for time_of_day
+    df['time_of_day_sin'] = np.sin(2 * np.pi * df['time_of_day'] / 24.0)
+    df['time_of_day_cos'] = np.cos(2 * np.pi * df['time_of_day'] / 24.0)
+    df['time_of_day_sin2'] = np.sin(4 * np.pi * df['time_of_day'] / 24.0)
+    df['time_of_day_cos2'] = np.cos(4 * np.pi * df['time_of_day'] / 24.0)
 
-    # Numba-accelerated rolling slope for multi-core performance
-    # @njit(parallel=True)
-    # def rolling_slope_numba(data, window):
-    #     n = len(data)
-    #     slopes = np.full(n, np.nan)
-    #     x = np.arange(window)
-    #     x_mean = np.mean(x)
-    #     denom = np.sum((x - x_mean) ** 2)
-    #     for i in prange(window - 1, n):
-    #         y = data[i - window + 1:i + 1]
-    #         if np.any(np.isnan(y)):
-    #             continue
-    #         y_mean = np.mean(y)
-    #         num = np.sum((x - x_mean) * (y - y_mean))
-    #         slopes[i] = num / denom
-    #     return slopes
-    #
-    # # Compute deltas using numba-accelerated rolling slope
-    # train_df['temperature_delta'] = rolling_slope_numba(train_df['temperature'].values, 15)
-    # val_df['temperature_delta'] = rolling_slope_numba(val_df['temperature'].values, 15)
-    # train_df['pressure_delta'] = rolling_slope_numba(train_df['station_pressure'].values, 15)
-    # train_df['humidity_delta'] = rolling_slope_numba(train_df['relative_humidity'].values, 15)
-    # val_df['pressure_delta'] = rolling_slope_numba(val_df['station_pressure'].values, 15)
-    # val_df['humidity_delta'] = rolling_slope_numba(val_df['relative_humidity'].values, 15)
-    # train_df['illuminance_delta'] = rolling_slope_numba(train_df['illuminance'].values, 15)
-    # train_df['solar_radiation_delta'] = rolling_slope_numba(train_df['solar_radiation'].values, 15)
-    # val_df['illuminance_delta'] = rolling_slope_numba(val_df['illuminance'].values, 15)
-    # val_df['solar_radiation_delta'] = rolling_slope_numba(val_df['solar_radiation'].values, 15)
+    # Cyclical encoding for day_of_year
+    df['day_of_year_sin'] = np.sin(2 * np.pi * df['day_of_year'] / 365.25)
+    df['day_of_year_cos'] = np.cos(2 * np.pi * df['day_of_year'] / 365.25)
 
-    # Manual interaction features - COMMENTED OUT: Using learned FeatureInteraction layer instead
-    # Time-of-day interactions with environmental factors
-    # train_df['time_sin_solar'] = train_df['time_of_day_sin'] * train_df['solar_radiation_delta']
-    # train_df['time_cos_solar'] = train_df['time_of_day_cos'] * train_df['solar_radiation_delta']
-    # train_df['time_sin_uv'] = train_df['time_of_day_sin'] * train_df['uv']
-    # train_df['time_cos_uv'] = train_df['time_of_day_cos'] * train_df['uv']
-    # val_df['time_sin_solar'] = val_df['time_of_day_sin'] * val_df['solar_radiation_delta']
-    # val_df['time_cos_solar'] = val_df['time_of_day_cos'] * val_df['solar_radiation_delta']
-    # val_df['time_sin_uv'] = val_df['time_of_day_sin'] * val_df['uv']
-    # val_df['time_cos_uv'] = val_df['time_of_day_cos'] * val_df['uv']
-    
-    # Additional interaction features - wind and temperature lag interactions
-    # train_df['time_sin_wind'] = train_df['time_of_day_sin'] * train_df['wind_avg']
-    # train_df['time_cos_wind'] = train_df['time_of_day_cos'] * train_df['wind_avg']
-    # train_df['time_sin_temp_lag'] = train_df['time_of_day_sin'] * train_df['temp_lag30']
-    # train_df['time_cos_temp_lag'] = train_df['time_of_day_cos'] * train_df['temp_lag30']
-    # val_df['time_sin_wind'] = val_df['time_of_day_sin'] * val_df['wind_avg']
-    # val_df['time_cos_wind'] = val_df['time_of_day_cos'] * val_df['wind_avg']
-    # val_df['time_sin_temp_lag'] = val_df['time_of_day_sin'] * val_df['temp_lag30']
-    # val_df['time_cos_temp_lag'] = val_df['time_of_day_cos'] * val_df['temp_lag30']
-    
-    # Add seasonal-time interactions (how environmental effects vary by season)
-    # train_df['season_sin_temp_lag'] = train_df['day_of_year_sin'] * train_df['temp_lag30']
-    # train_df['season_cos_temp_lag'] = train_df['day_of_year_cos'] * train_df['temp_lag30']
-    # train_df['season_sin_humidity'] = train_df['day_of_year_sin'] * train_df['humidity_lag30']
-    # train_df['season_cos_humidity'] = train_df['day_of_year_cos'] * train_df['humidity_lag30']
-    # val_df['season_sin_temp_lag'] = val_df['day_of_year_sin'] * val_df['temp_lag30']
-    # val_df['season_cos_temp_lag'] = val_df['day_of_year_cos'] * val_df['temp_lag30']
-    # val_df['season_sin_humidity'] = val_df['day_of_year_sin'] * val_df['humidity_lag30']
-    # val_df['season_cos_humidity'] = val_df['day_of_year_cos'] * val_df['humidity_lag30']
+    # Cyclical encoding for wind_direction if available
+    if 'wind_direction' in df.columns:
+        df['wind_direction_sin'] = np.sin(2 * np.pi * df['wind_direction'] / 360.0)
+        df['wind_direction_cos'] = np.cos(2 * np.pi * df['wind_direction'] / 360.0)
 
-    # Calculate temperature differences as targets
-    # Instead of predicting absolute temperatures, predict the change from current temperature
-    train_df['temp_diff_1hr'] = train_df['temp_t+1hr'] - train_df['temperature']
-    train_df['temp_diff_2hr'] = train_df['temp_t+2hr'] - train_df['temperature']
-    train_df['temp_diff_3hr'] = train_df['temp_t+3hr'] - train_df['temperature']
+    # Future temperature targets (1-minute interval data, so 60 rows = 1 hour)
+    df['temp_t+1hr'] = df['temperature'].shift(-60)
+    df['temp_t+2hr'] = df['temperature'].shift(-120)
+    df['temp_t+3hr'] = df['temperature'].shift(-180)
 
-    val_df['temp_diff_1hr'] = val_df['temp_t+1hr'] - val_df['temperature']
-    val_df['temp_diff_2hr'] = val_df['temp_t+2hr'] - val_df['temperature']
-    val_df['temp_diff_3hr'] = val_df['temp_t+3hr'] - val_df['temperature']
+    # Temperature difference targets
+    df['temp_diff_1hr'] = df['temp_t+1hr'] - df['temperature']
+    df['temp_diff_2hr'] = df['temp_t+2hr'] - df['temperature']
+    df['temp_diff_3hr'] = df['temp_t+3hr'] - df['temperature']
 
-    # Drop rows with NaNs
-    train_df.dropna(inplace=True)
-    val_df.dropna(inplace=True)
+    # Drop rows with NaNs (lag features + future targets)
+    print(f"Data before dropping NaNs: {len(df)} rows")
+    df.dropna(inplace=True)
+    print(f"Data after dropping NaNs: {len(df)} rows")
+
+    if len(df) == 0:
+        raise ValueError("No valid data remaining after preprocessing.")
+
+    # Temporal train/val split: older data = training, newer data = validation
+    total_duration = df.index.max() - df.index.min()
+    split_time = df.index.min() + total_duration * TRAIN_VAL_SPLIT_RATIO
+    split_idx = df.index.get_indexer([split_time], method='nearest')[0]
+    train_df = df.iloc[:split_idx].copy()
+    val_df = df.iloc[split_idx:].copy()
+
+    print(f"Temporal split at {split_time}:")
+    print(f"  Training:   {len(train_df)} rows ({train_df.index.min()} to {train_df.index.max()})")
+    print(f"  Validation: {len(val_df)} rows ({val_df.index.min()} to {val_df.index.max()})")
+
+    if len(train_df) < MIN_SAMPLES_PER_SET or len(val_df) < MIN_SAMPLES_PER_SET:
+        print(f"⚠️  Warning: small dataset (train={len(train_df)}, val={len(val_df)}, min={MIN_SAMPLES_PER_SET})")
+
+    import gc
+    del df
+    gc.collect()
 
     # Define feature and target columns
     features = [
@@ -531,7 +616,7 @@ def main():
 
         quantized_tflite_model = converter.convert()
 
-        tflite_fname = f"weather_model_5a_quant_{name}.tflite"
+        tflite_fname = f"weather_model_5a_ps_{name}.tflite"
         with open(tflite_fname, "wb") as f:
             f.write(quantized_tflite_model)
 
@@ -580,16 +665,16 @@ def main():
 
     # Copy best model to canonical filename
     import shutil
-    best_model_file = f"weather_model_5a_quant_{best['name']}.tflite"
-    shutil.copy(best_model_file, "weather_model_5a_best.tflite")
-    print(f"Best model copied to: weather_model_5a_best.tflite")
+    best_model_file = f"weather_model_5a_ps_{best['name']}.tflite"
+    shutil.copy(best_model_file, "weather_model_5a_ps_best.tflite")
+    print(f"Best model copied to: weather_model_5a_ps_best.tflite")
     
     # Validate the best quantized model
     print("\n" + "="*50)
     print("VALIDATING BEST QUANTIZED MODEL")
     print("="*50)
     y_val_array = val_df[targets].values
-    validate_quantized_model("weather_model_5a_best.tflite", X_val_small, y_val_array, y_min, y_max)
+    validate_quantized_model("weather_model_5a_ps_best.tflite", X_val_small, y_val_array, y_min, y_max)
 
 # --- Validate quantized TFLite model on validation data ---
 def validate_quantized_model(tflite_model_path, X_val, y_val, y_min, y_max, num_samples=500):

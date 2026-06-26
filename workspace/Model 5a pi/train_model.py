@@ -82,6 +82,46 @@ def main():
         'wind_direction', 'wind_lull', 'rain_accumulated',
     }
 
+    def _invalidate_targets_crossing_gaps(df, label, tol_s=300):
+        """Null shift()-based target values whose future lookup crosses a time gap.
+
+        df['temp_t+1hr'] = df['temperature'].shift(-60) is purely positional — a
+        row 59 steps before a gap references post-gap (potentially glitched) data.
+        Nulling those targets here lets the subsequent dropna() remove them cleanly.
+        """
+        if not isinstance(df.index, pd.DatetimeIndex):
+            return df
+
+        target_shifts = {60: "temp_t+1hr", 120: "temp_t+2hr", 180: "temp_t+3hr"}
+        present = {steps: col for steps, col in target_shifts.items() if col in df.columns}
+        if not present:
+            return df
+
+        dt_s = df.index.to_series().diff().dt.total_seconds()
+        gap_positions = np.flatnonzero((dt_s > float(tol_s)).to_numpy())
+        if gap_positions.size == 0:
+            print(f"\n✅ {label}: no cross-gap target contamination detected")
+            return df
+
+        df = df.copy()
+        n_nulled = 0
+
+        for pos in gap_positions:
+            for steps, col in present.items():
+                start = max(0, pos - steps)
+                if start < pos:
+                    null_idx = df.index[start:pos]
+                    df.loc[null_idx, col] = np.nan
+                    n_nulled += len(null_idx)
+
+        if n_nulled > 0:
+            print(f"\n⚠️  {label}: nulled {n_nulled} cross-gap target lookups across "
+                  f"{gap_positions.size} gap(s) — will be removed by dropna()")
+        else:
+            print(f"\n✅ {label}: no cross-gap target contamination detected")
+
+        return df
+
     def load_influx_data(cfg, label):
         """Load all data from one InfluxDB database into a time-indexed DataFrame."""
         print(f"\nConnecting to InfluxDB [{label}] ({cfg['database']})...")
@@ -212,10 +252,23 @@ def main():
     df['temp_t+2hr'] = df['temperature'].shift(-120)
     df['temp_t+3hr'] = df['temperature'].shift(-180)
 
+    # Null target values that reference post-gap (potentially glitched) InfluxDB data.
+    # Must run before diff computation so corrupted targets never enter training targets.
+    # tol_s=600: only invalidate around real outages (10+ min gaps); the 215 triggers
+    # at 300s mostly cover short gaps that don't corrupt shift()-based targets.
+    df = _invalidate_targets_crossing_gaps(df, "df", tol_s=600)
+
     # Temperature difference targets
     df['temp_diff_1hr'] = df['temp_t+1hr'] - df['temperature']
     df['temp_diff_2hr'] = df['temp_t+2hr'] - df['temperature']
     df['temp_diff_3hr'] = df['temp_t+3hr'] - df['temperature']
+
+    # Clip extreme target values that are physically implausible sensor glitches.
+    # p99.9 of 3hr diffs is ~10°C in real data; ±12°C is generous and catches
+    # the handful of residual outliers not removed by gap invalidation.
+    DIFF_CLIP = 12.0
+    diff_targets = ['temp_diff_1hr', 'temp_diff_2hr', 'temp_diff_3hr']
+    df[diff_targets] = df[diff_targets].clip(-DIFF_CLIP, DIFF_CLIP)
 
     # Drop rows with NaNs (lag features + future targets)
     print(f"Data before dropping NaNs: {len(df)} rows")
@@ -529,11 +582,11 @@ def main():
 
         eval_results = model.evaluate(val_ds, verbose=0)
         val_loss = eval_results[0]
-        val_mae = np.mean(eval_results[1:])  # average MAE across 3 targets
+        val_mae = np.mean(eval_results[4:7])  # average MAE across 3 targets
         # Report MAEs in original units (°C difference)
-        diff_1_mae_c = eval_results[1] * (y_max - y_min) / 2  # Convert from [-1,1] to original scale
-        diff_2_mae_c = eval_results[2] * (y_max - y_min) / 2
-        diff_3_mae_c = eval_results[3] * (y_max - y_min) / 2
+        diff_1_mae_c = eval_results[4] * (y_max - y_min) / 2  # Convert from [-1,1] to original scale
+        diff_2_mae_c = eval_results[5] * (y_max - y_min) / 2
+        diff_3_mae_c = eval_results[6] * (y_max - y_min) / 2
         print(f"\nValidation MAE (in °C difference):")
         print(f"  diff_1hr: {diff_1_mae_c:.2f} °C")
         print(f"  diff_2hr: {diff_2_mae_c:.2f} °C")
@@ -574,8 +627,9 @@ def main():
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
 
         def representative_data_gen():
-            # Use a small, random subset of windows for calibration
-            num_samples = 500  # 100–1000 is usually plenty
+            # Larger calibration set improves INT8 range estimation, especially
+            # for the squaring path which has a wide, skewed activation distribution.
+            num_samples = 2000
             n = X_train_flat.shape[0]
 
             for _ in range(num_samples):
@@ -716,3 +770,4 @@ def validate_quantized_model(tflite_model_path, X_val, y_val, y_min, y_max, num_
 # Entry point guard
 if __name__ == "__main__":
     main()
+
