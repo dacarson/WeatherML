@@ -22,6 +22,30 @@ See [MODEL_5C_PLAN.md](MODEL_5C_PLAN.md) for full project plan, track definition
 
 ---
 
+## Data Quality — Sensor Glitch Filter (2026-07-19)
+
+**Found**: `temp_diff_1hr/2hr/3hr` scaling bounds printed at training start showed an implausible global target range of −31.50°C to 28.60°C (`temp_diff_3hr` raw range [−29.50, 26.60]°C) — a ~30°C temperature swing within 3 hours never happens in SF. Traced to raw sensor-glitch rows in `train_data_sf.csv`, e.g. `2023-01-23 09:18–09:20 UTC`: `temperature` reads `11.1°C → 0.9°C → -7.5°C → 9.9°C` in 7 minutes with `relative_humidity` simultaneously collapsing to `0.0` — a brief sensor dropout/fault, not real weather. Because `temp_diff_Nhr` targets are built via `merge_asof` against raw `temperature`, this single bad reading poisoned targets for every row within 1–3hr of it (not just the glitch row itself). Found 17 such glitch rows in `train_data_sf.csv` (0 in `val_data_sf.csv`) by flagging points that deviate >6°C from a centered 31-minute rolling median of `temperature`.
+
+**Fix**: Added `_sanity_filter_temperature()` to both `train_model_tft_track_a.py` and `train_model_track_b.py`, called immediately after `_prepare_time_index()` and before `_add_future_targets()`/lag construction. Nulls `temperature` on any row whose value deviates >6°C from the local (time-centered, 31min window) median; downstream `dropna` removes the row (and any row whose future-target lookup lands on it) as it already does for other missing-feature rows.
+
+**Verified impact** (simulated the full load → filter → target pipeline against the real CSVs):
+- `train_data_sf.csv`: 17 rows nulled → target ranges shrink from `temp_diff_3hr` raw [−29.50, 26.60]°C to [−13.10, 17.40]°C. ~14k of 1.5M rows (~0.9%) lost overall (each glitch poisons targets up to 3hr before it).
+- `val_data_sf.csv`: 0 rows nulled (no glitches present) — bounds move slightly because the *global* scaler is fit on train only, but val was never itself contaminated.
+
+**Next steps**: Re-run Track B Run 16 (results were still TBD) and any future Track A run with this filter active — target scaling bounds should now be physically plausible. If new implausible bounds show up again after a re-run, re-check with a smaller `threshold_c` or wider window rather than assuming the filter caught everything (it targets fast spike-and-revert glitches specifically, not sustained sensor drift).
+
+**Correction (same day, 2026-07-19)**: The filter above was insufficient on its own — a re-run still showed the exact same −31.50/28.60°C bounds. Root cause: `train_data_sf.csv`/`val_data_sf.csv` ship with **pre-baked** `temp_t+1hr/2hr/3hr` columns from an earlier (external) export pipeline, and `_add_future_targets()` has an early-return — `if all(c in df.columns for c in [...]): return df` — that skips its own `merge_asof` reconstruction whenever those columns already exist. Since they always exist in these CSVs, targets were *always* being read straight from the stale pre-baked columns, never from the gap-aware, sanity-filterable path the script appears to implement. Confirmed directly: row `2023-01-23 08:21:00` has `temperature=11.1` but a pre-baked `temp_t+1hr=-17.1` — a value that doesn't even appear as a `temperature` reading anywhere nearby, i.e. the external pipeline that built these columns has its own independent corruption, worse than what's visible in raw `temperature`. This also means `_invalidate_targets_crossing_gaps()` — which only operates on freshly-computed target columns — has likely never actually taken effect in either track before now.
+
+**Fix**: Both scripts now drop `temp_t+1hr/2hr/3hr` immediately after `pd.read_csv()`, forcing `_add_future_targets()` to always run its `merge_asof` reconstruction against the (sanity-filtered) `temperature` series, with gap invalidation applying as designed. Re-verified against the live scripts (not a reimplementation — patched a throwaway copy to exit right after the SCALING BOUNDS print and ran it for real): `Global target range: -15.10°C to 19.40°C`, `temp_diff_3hr: raw [-13.10, 17.40]°C` — matches the sanity-filter-only simulation, confirming both fixes now compose correctly. After dropna: train=1,451,939 rows (was 1,506,208 raw), val=516,005 (was 526,115).
+
+**Root cause upstream, and re-export (same day, 2026-07-19)**: Traced the pre-baked columns to `workspace/export_influx_to_csv.py:56-58` — `df['temp_t+1hr'] = df['temperature'].shift(-60)` (and `-120`/`-180`). This is a **row-count** shift, not time-based: it assumes exactly one reading per minute with zero gaps. The station doesn't sample that regularly (confirmed irregular report intervals throughout), so any gap silently misaligns "N rows later" against "N minutes later." Fixed by replacing all three with a `merge_asof`-based `_future_temperature()` helper (90s tolerance), mirroring `_add_future_targets()` in the training scripts exactly.
+
+Correction to the claim above: `temp_t+1hr=-17.1` at `08:21:00` is **not** unexplained corruption — queried InfluxDB directly for `09:15:00–09:40:00` on `2023-01-23` and confirmed genuine raw readings at `09:21:00 (-10.9°C)` and `09:22:00 (-17.1°C)` that don't appear in `train_data_sf.csv` because `export_influx_to_csv.py`'s `dropna(subset=required_fields)` drops them (missing some other required field during the fault window) — but only *after* target construction, so their temperature values still legitimately fed 1hr-later lookups for earlier rows. So the sensor fault on `2023-01-23 09:18–09:23` is a genuine 4-minute event (`11.1 → 0.9 → -7.5 → -10.9 → -17.1 → 9.6°C`), more sustained than the 2-minute version visible in the exported CSV alone — real bad sensor data, not a pipeline artifact. This is exactly what `_sanity_filter_temperature()` in the training scripts exists to catch; it was never redundant.
+
+Re-exported both CSVs (`export_influx_to_csv.py`, fetch range extended from `2022-06-22 → 2026-06-24` to `2022-06-22 → 2026-07-19`; `val_end` grown from `2026-06-23` to `2026-07-19` so the extra month lands in validation rather than being fetched-and-discarded; `train_end`/`val_start` unchanged). Pre-export CSVs backed up to `workspace/backup_pre_export_fix_20260719/`. New row counts: train 1,487,454 (export-level dropna), val 557,593 — then Track B's own pipeline (sanity filter + fresh merge_asof + its dropna) brings it to train=1,407,546, val=539,684. Re-verified target bounds against the live script with the new CSVs: unchanged at `Global target range: -15.10°C to 19.40°C` — confirms the export fix and the training-script fix are consistent and non-conflicting.
+
+---
+
 ## Pre-Run Architecture Decisions
 
 These decisions were made before any training run. They define the Run 1 baseline configuration and the rationale for each choice.
@@ -2196,13 +2220,107 @@ If any head shifts to t-240, t-300, or t-360 in the deep run, those positions re
 
 **VSN weights**: not expected to change meaningfully vs Run 6 — the feature set is identical and the model was stable from Runs 4–6. VSN is driven by *which features* matter, not by *how far back* to look.
 
-**Outcome**: ⚠️ IN PROGRESS (Session 1 of 3–4 complete) — Awaiting Session 2 resume.
+**Outcome (Kaggle Session 1)**: ⚠️ PARTIAL — Ran out of Kaggle time at epoch 136. Sessions 2–4 were superseded by the Mac Metal run below.
+
+---
+
+### Mac Metal Run — SEQ_LEN=360 (Complete, 2026-06-30)
+
+**Platform**: Mac Metal (M-series)  
+**Results stored in**: `results_5c_track_a_mac_run1/`  
+**Training**: Fresh start, same configuration (SEQ_LEN=360, D_MODEL=128, N_HEADS=8, L2=1e-4)  
+**Step time**: ~6250s/epoch
+
+**Results**:
+- val_loss (includes L2): **0.000728**
+- val_task_loss (best): **≈0.000696** (implied from ReduceLR "best=0.000696" at epoch 44/56)
+- val_mae (normalized): **0.003504**
+- diff_1hr MAE: **0.002°C** | diff_2hr: **0.004°C** | diff_3hr: **0.008°C**
+- Best epoch: **32/450** — early stopped at epoch 62 (patience=30), 2 LR halvings (→5e-5→2.5e-5) couldn't push further
+- No NaN ✅ | TFLite blocked (VSN einsum, same as all prior runs) ✅
+
+vs baseline:
+- Run 6 (SEQ_LEN=180) val_loss=0.000953 → **−24% ✅**
+- Track A target (0.000373): **1.95× off** — same architectural gap persists
+
+**Permutation feature importance**:
+
+| Rank | Feature | Score |
+|------|---------|-------|
+| 1 | temperature | **0.0301** (clear leader) |
+| 2 | wind_gust | 0.0198 (suspicious — was floor in Runs 2–6) |
+| 3–22 | (dense cluster) | 0.0178–0.0197 |
+| 23 | time_of_day_sin2 | 0.0178 |
+| 24 | time_of_day_cos | **0.0178** (was #1 in Runs 4–6 at 0.036) |
+
+Unusually flat distribution: only `temperature` stands out; time_of_day_cos fell from #1 (0.036) to bottom-2 (0.0178). The flat cluster and `wind_gust` appearing at #2 are consistent with early stopping at epoch 32 — the model may have reached a local minimum before perm importances fully differentiated. Feature discovery validity is limited for this run; VSN weights and attention maps are more reliable.
+
+**VSN feature importance (Deep Run vs Run 6)**:
+
+| Feature | Mac Deep Run | Run 6 (SEQ_LEN=180) | Delta |
+|---------|-------------|---------------------|-------|
+| **temp_slope_60** | **0.1764** | 0.0693 | **+0.1071 ← dominant jump** |
+| temp_slope_15 | 0.1011 | 0.0706 | +0.0305 |
+| temperature | 0.0920 | 0.0994 | −0.0074 |
+| humidity_slope_30 | 0.0821 | 0.0552 | +0.0269 |
+| relative_humidity | 0.0677 | 0.0484 | +0.0193 |
+| time_of_day_cos | 0.0591 | **0.0982** | **−0.0391 ← large drop** |
+| station_pressure | 0.0531 | 0.0484 | +0.0047 |
+| temp_slope_30 | 0.0518 | 0.0349 | +0.0169 |
+| time_of_day_sin | 0.0486 | 0.0827 | −0.0341 |
+| solar_slope_30 | 0.0473 | 0.0430 | +0.0043 |
+| wind_gust | 0.0023 | 0.0237 | −0.0214 |
+| wind_lull | 0.0017 | 0.0013 | ≈0 |
+| rain_accumulated | 0.0047 | 0.0015 | ≈0 |
+
+Key VSN shifts:
+- **temp_slope_60 exploded from 5th (0.0693) to 1st (0.1764)**: with 6hr context, the 60-min slope is the dominant feature — 2.5× its Run 6 weight and 1.75× the second-place temp_slope_15. All three slope features (15/30/60) rose together; with a 6hr window, medium-term trend signals are more informative.
+- **time_of_day_cos fell from 2nd (0.0982) to 6th (0.0591)**: with 6 hours of history providing richer temporal context via attention, the hand-crafted cyclical encoding matters less at VSN level.
+- **humidity_slope_30 and relative_humidity both rose**: humidity signal gains importance when the model can look 5–6 hours back.
+
+**Attention maps — CRITICAL FINDING**:
+
+| Lag | Weight | Notes |
+|-----|--------|-------|
+| t-359min (pos 0) | **0.1215** | 6-hour boundary anchor — **dominant** |
+| t-358min (pos 1) | 0.0178 | |
+| t-295min (pos 64) | 0.0129 | **~5-hour secondary anchor** |
+| t-296min (pos 63) | 0.0119 | ~5-hour cluster |
+| t-347min (pos 12) | 0.0112 | ~5.8-hour cluster |
+| t-348min (pos 11) | 0.0110 | ~5.8-hour cluster |
+| t-318min (pos 41) | 0.0104 | ~5.3-hour |
+| t-301min (pos 58) | 0.0097 | ~5-hour cluster |
+| t-297min (pos 62) | 0.0091 | ~5-hour cluster |
+| t-346min (pos 13) | 0.0090 | ~5.8-hour |
+
+**The pre-run question is answered**: the attention peak at t-179 in Runs 4–6 (weight 0.1268) was a **boundary artifact**. With SEQ_LEN=360, the model immediately pinned to t-359 at almost the same weight (0.1215). The 3-hour horizon was not a natural cutoff — it was the oldest available timestep in the window.
+
+Notable: the prior 1-hour (t-57–61) and 2-hour (t-120) anchors are absent from the top-10 with SEQ_LEN=360. The attention reorganized around the 5–6 hour range entirely. This may be partially due to early convergence at epoch 32.
+
+**The 5-hour anchor (~t-295 to t-301) is a genuine finding**: this cluster is NOT at the window boundary (t-359); it is a secondary peak ~64 timesteps from the edge. In prior runs the secondary anchor was t-120 (2hr, Head 6 specialist). Here the secondary cluster is ~5 hours.
+
+**Key findings — summary**:
+
+1. **Boundary artifact confirmed**: The t-179 attention peak in Runs 4–6 was an artifact of the window edge, not a natural 3-hour horizon. The model wants to look as far back as the window allows.
+
+2. **Natural secondary anchor: ~5 hours (t-295 to t-301)**: not at the boundary, appears multiple times (0.0097–0.0129). This is a genuine lag candidate for Track B.
+
+3. **temp_slope_60 dominates with 6hr context**: already in Track B feature set — validated at higher importance than previously known. The 6hr run reveals it is the primary trend carrier when longer history is available.
+
+4. **Early stopping at epoch 32 limits reliability**: best epoch 32/450 is early vs prior runs (236–445 epochs). Perm importances are suspect; VSN and attention are more stable but may not be fully converged. The val_task_loss of 0.000696 beats all prior Track A runs, but a longer run might extract further signal.
+
+**Track B implications from Deep Run**:
+- **Add 5-hour lags**: `temp_diff_vs_5hr` (= temperature − temp_lag300) is the primary new Track B candidate from this run. t-295–301 cluster maps to approximately 5-hour lookback.
+- **Add 6-hour diff as stretch feature**: `temp_diff_vs_6hr` (= temperature − temp_lag360) may capture additional signal, though it sits at the boundary where interpretation is uncertain.
+- **Existing 3-hour lag remains valid**: `temp_diff_vs_3hr` is still a meaningful anchor (the TFT always attended to it in Runs 4–6), even though it's not a natural boundary. Track B should keep it.
+- **1-hour and 2-hour anchors**: not confirmed in this run (absent from top-10 attention), but were strong in 4 of 5 prior SEQ_LEN=180 runs — retain them; the absence here may be an early-stopping artifact.
+
+**Outcome**: ✅ COMPLETE — Deep run answered the boundary question. t-179 was a boundary artifact; model wants to look 5–6 hours back. New Track B candidate: 5-hour lag features. val_loss=0.000728 (−24% vs Run 6). Early stopping at epoch 32 limits perm importance reliability; VSN and attention findings are used for Track B design.
 
 **Next steps**:
-- Publish checkpoint to Kaggle dataset and resume Session 2
-- Compare attention maps with Run 6 once fully converged to determine if t-179 is a true boundary or artifact
-- If attention is contained within t-0 to t-180: confirm 3-hour window, no Track B changes needed
-- If attention spills to t-240+: add new lag anchors to Track B feature set
+- Add `temp_diff_vs_5hr` (and optionally `temp_diff_vs_6hr`) to Track B feature candidates
+- Track B Run 15+ (QAT) continues on the settled INT8 path — deep run findings inform a future Track B feature ablation if needed
+- No further Track A runs planned — feature discovery is complete
 
 ---
 

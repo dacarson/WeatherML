@@ -334,6 +334,17 @@ def main():
     train_df = pd.read_csv(f"{data_dir}/train_data_sf.csv")
     val_df = pd.read_csv(f"{data_dir}/val_data_sf.csv")
 
+    # The raw CSVs ship with pre-baked temp_t+1hr/2hr/3hr columns from an earlier export
+    # pipeline. _add_future_targets() short-circuits (returns df unchanged) whenever those
+    # columns already exist, so keeping them means the sanity filter below (and the
+    # gap-aware merge_asof reconstruction in _add_future_targets/_invalidate_targets_
+    # crossing_gaps) never actually run — targets stay locked to whatever that external
+    # pipeline computed, including any of its own bad readings. Drop them so targets are
+    # always freshly derived from (now sanity-filtered) 'temperature'.
+    _stale_target_cols = ["temp_t+1hr", "temp_t+2hr", "temp_t+3hr"]
+    train_df = train_df.drop(columns=[c for c in _stale_target_cols if c in train_df.columns])
+    val_df = val_df.drop(columns=[c for c in _stale_target_cols if c in val_df.columns])
+
     def _prepare_time_index(df: pd.DataFrame, label: str) -> pd.DataFrame:
         time_col = None
         for c in ("time", "timestamp", "ts", "datetime", "date"):
@@ -363,6 +374,28 @@ def main():
         df = df.set_index(time_col).sort_index()
         if df.index.has_duplicates:
             df = df[~df.index.duplicated(keep="last")]
+        return df
+
+    def _sanity_filter_temperature(df: pd.DataFrame, label: str, window: str = "31min",
+                                    threshold_c: float = 6.0) -> pd.DataFrame:
+        # Raw station data contains rare sensor-glitch rows (brief dropout/self-heating,
+        # not real weather) where temperature jumps implausibly fast and reverts a few
+        # minutes later — e.g. 2023-01-23 09:18 UTC: 11.1°C -> -7.5°C -> 9.9°C with
+        # relative_humidity simultaneously collapsing to 0%. These poisoned the
+        # temp_diff_Nhr targets (e.g. -31.5°C global min) since diffs are computed via
+        # merge_asof against raw 'temperature'. Null any reading that deviates from its
+        # local (time-centered) median by more than threshold_c; downstream dropna
+        # removes the row entirely. Found via `git log` discussion 2026-07-19.
+        if not isinstance(df.index, pd.DatetimeIndex):
+            return df
+        df = df.copy()
+        local_median = df["temperature"].rolling(window, center=True, min_periods=3).median()
+        spike = (df["temperature"] - local_median).abs() > threshold_c
+        n_spikes = int(spike.sum())
+        if n_spikes:
+            df.loc[spike, "temperature"] = np.nan
+            print(f"⚠️  {label}: nulled {n_spikes} temperature sensor-glitch rows "
+                  f"(>{threshold_c}°C from local {window} median)")
         return df
 
     def _add_future_targets(df: pd.DataFrame, label: str, tolerance_s: int = 90) -> pd.DataFrame:
@@ -440,6 +473,8 @@ def main():
 
     train_df = _prepare_time_index(train_df, "train_df")
     val_df = _prepare_time_index(val_df, "val_df")
+    train_df = _sanity_filter_temperature(train_df, "train_df")
+    val_df = _sanity_filter_temperature(val_df, "val_df")
     train_df = _add_future_targets(train_df, "train_df")
     val_df = _add_future_targets(val_df, "val_df")
     train_df = _invalidate_targets_crossing_gaps(train_df, "train_df", tol_s=600)
@@ -506,6 +541,10 @@ def main():
     # -------------------------------------------------------------------------
     SEQ_LEN = 360  # 6-hour history window (Track A deep — probing beyond t-179 boundary)
     GAP_STEP_TOLERANCE_S = 90
+    # Kaggle keeps stride=1 (maximize samples for final training).
+    # Mac local: stride=10 cuts epochs from ~106 min to ~10 min.
+    # Consecutive windows at stride=1 overlap by 99.7% — negligible diversity loss.
+    SEQUENCE_STRIDE = 1 if KAGGLE_MODE else 10
 
     def _apply_gap_safety(df: pd.DataFrame, label: str, seq_len: int, max_step_s: int) -> pd.DataFrame:
         df = df.copy()
@@ -654,21 +693,20 @@ def main():
     # -------------------------------------------------------------------------
     from tensorflow.keras.preprocessing import timeseries_dataset_from_array
 
-    # Kaggle T4 (16GB VRAM) can handle 512. Mac Metal unified memory is shared with the OS,
-    # so use 32 to stay within budget given attention is O(SEQ_LEN²) = O(360²).
-    # Increase to 64 if your Mac has 32GB+ and no OOM errors appear.
+    # Kaggle T4 (16GB VRAM): 512.  Mac Metal: 64 keeps GPU fed without OOM.
+    # Increase to 128 on 32GB+ Macs if Activity Monitor shows GPU still under-utilized.
     # Set FORCE_CPU=1 if Metal hangs — CPU runs cleanly (hangs are Metal-specific).
-    TRAIN_BATCH_SIZE = 512 if KAGGLE_MODE else 32
-    VAL_BATCH_SIZE = 512 if KAGGLE_MODE else 32
+    TRAIN_BATCH_SIZE = 512 if KAGGLE_MODE else 64
+    VAL_BATCH_SIZE = 512 if KAGGLE_MODE else 64
 
     train_ds = timeseries_dataset_from_array(
         data=X_train_flat, targets=y_all_train,
-        sequence_length=SEQ_LEN, sequence_stride=1, sampling_rate=1,
+        sequence_length=SEQ_LEN, sequence_stride=SEQUENCE_STRIDE, sampling_rate=1,
         batch_size=TRAIN_BATCH_SIZE, shuffle=True,
     )
     val_ds = timeseries_dataset_from_array(
         data=X_val_flat, targets=y_all_val,
-        sequence_length=SEQ_LEN, sequence_stride=1, sampling_rate=1,
+        sequence_length=SEQ_LEN, sequence_stride=SEQUENCE_STRIDE, sampling_rate=1,
         batch_size=VAL_BATCH_SIZE, shuffle=False,
     )
 
@@ -681,11 +719,11 @@ def main():
 
     train_steps = int(train_ds.cardinality().numpy())
     train_ds = train_ds.repeat()
-    # prefetch=16 locally: keeps GPU fed without the runaway memory growth that
-    # AUTOTUNE causes (it grows adaptively to hundreds of batches over epochs).
-    # 16 × ~16 MB/batch (fp16, batch=1024) ≈ 256 MB — well within GPU budget.
-    train_ds = train_ds.prefetch(buffer_size=AUTOTUNE if KAGGLE_MODE else 16)
-    val_ds = val_ds.prefetch(buffer_size=AUTOTUNE if KAGGLE_MODE else 16)
+    # AUTOTUNE everywhere: TF measures how fast the GPU drains the queue and
+    # buffers just enough batches to keep it fed.  The fixed-16 cap we used
+    # previously starved the GPU on Mac (small batches drain in <100 ms).
+    train_ds = train_ds.prefetch(buffer_size=AUTOTUNE)
+    val_ds = val_ds.prefetch(buffer_size=AUTOTUNE)
 
     print(f"\nTraining: {train_steps} batches/epoch (batch_size={TRAIN_BATCH_SIZE})")
     print(f"Validation: {val_ds.cardinality().numpy()} batches")
@@ -971,11 +1009,14 @@ def main():
                 except Exception as e:
                     # Keras 3 integrates loss scaling internally — no wrapper needed
                     print(f"   ℹ️  LossScaleOptimizer not needed in this Keras version: {e}")
+            # steps_per_execution>1 keeps the Metal command queue filled between
+            # Python callbacks, reducing GPU idle time.  Batch-level callbacks
+            # (watchdog, NaN terminator, progress) still fire — just every N steps.
             model.compile(
                 optimizer=optimizer,
                 loss='mse',
                 metrics={'diff_1hr': 'mae', 'diff_2hr': 'mae', 'diff_3hr': 'mae'},
-                steps_per_execution=1,
+                steps_per_execution=1 if KAGGLE_MODE else 10,
             )
 
         # Analysis model shares all weights with `model` — outputs attention maps for Track B

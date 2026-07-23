@@ -3,10 +3,12 @@
 # Runs inference using the INT8 TFLite model on Coral Edge TPU (falls back to FP32
 # TFLite on CPU when no TPU delegate is available, e.g. Mac development).
 #
-# Compatible with Runs 1–5 (SEQ_LEN=1, flat feature vector) and Run 6+
-# (SEQ_LEN=180, 3-hour sliding window + AveragePooling). The sequence length is
-# detected automatically from the loaded model's input shape — no code change needed
-# when switching between runs.
+# Compatible with Runs 1–5 (SEQ_LEN=1, flat feature vector), Run 6-15 (SEQ_LEN=180,
+# 3-hour sliding window + AveragePooling), and Run 16+ (adds temp_diff_vs_5hr/6hr
+# scalar lag features). The sequence length and feature set are both detected
+# automatically (SEQ_LEN from the model's input shape, features from input_scaler.json)
+# — no code change needed when switching between runs, as long as every feature a
+# given run's input_scaler.json references has a corresponding column computed below.
 #
 # Predictions are stored at the TARGET timestamp (T+1hr, T+2hr, T+3hr) so that
 # Grafana shows them as a forward-looking fan from "now".
@@ -23,7 +25,7 @@ import argparse
 # ---------------------------------------------------------------------------
 # Configuration — update RUN_NAME to switch between trained runs
 # ---------------------------------------------------------------------------
-RUN_NAME    = "dense_b_run1"
+RUN_NAME    = "dense_b_run17"
 RESULTS_DIR = f"./results_5c_trackb_{RUN_NAME}"
 
 MODEL_EDGETPU_PATH = f"{RESULTS_DIR}/model_trackb_{RUN_NAME}_int8_edgetpu.tflite"
@@ -49,7 +51,7 @@ LOCATIONS = {
 }
 
 QUERY_BATCH_SIZE  = 250_000   # minutes of weather data per batch (≈55 days)
-WARM_UP_MINUTES   = 240      # lookback for 180-min lags + 60-min slope warm-up
+WARM_UP_MINUTES   = 420      # lookback for 360-min temp_diff_vs_6hr lag (Run 16+) + 60-min buffer
 BACKFILL_HOURS    = 3        # re-run last N hours to add newly-available actuals
 EXTRA_SAMPLES     = 250      # extra buffer past batch window
 
@@ -136,6 +138,20 @@ def _future_temp_at(df_index, temperatures, offset, tol_s=90):
     src  = pd.DataFrame({"src_time": df_index, "temperature": temperatures})
     merged = pd.merge_asof(base, src, left_on="lookup_time", right_on="src_time",
                            direction="forward", tolerance=tol)
+    return merged["temperature"].to_numpy(dtype=np.float32)
+
+
+def _past_temp_at(df_index, temperatures, offset, tol_s=90):
+    """Return past temperature at (t - offset) via backward merge_asof.
+    Matches the training pipeline's _add_past_lags (temp_diff_vs_5hr/6hr, Run 16+) —
+    deliberately NOT gap_aware_lag's reindex(method="nearest"), which can match a
+    reading slightly AFTER the lookup time; training only ever looks backward."""
+    tol = pd.Timedelta(seconds=tol_s)
+    base = pd.DataFrame({"base_time": df_index})
+    base["lookup_time"] = base["base_time"] - offset
+    src  = pd.DataFrame({"src_time": df_index, "temperature": temperatures})
+    merged = pd.merge_asof(base, src, left_on="lookup_time", right_on="src_time",
+                           direction="backward", tolerance=tol)
     return merged["temperature"].to_numpy(dtype=np.float32)
 
 
@@ -399,11 +415,17 @@ df["temp_diff_vs_3hr"] = df["temperature"] - _temp_lag180
 df["pressure_lag120"] = gap_aware_lag(df["station_pressure"], 120)
 df["pressure_lag180"] = gap_aware_lag(df["station_pressure"], 180)
 df["humidity_lag60"]  = gap_aware_lag(df["relative_humidity"], 60)
+
+# Run 16+ features: temp_diff_vs_5hr/6hr (Track A Deep Run non-boundary attention anchor).
+temperatures_arr = df["temperature"].values.astype(np.float32)
+_temp_lag300 = _past_temp_at(df.index, temperatures_arr, pd.Timedelta(minutes=300))
+_temp_lag360 = _past_temp_at(df.index, temperatures_arr, pd.Timedelta(minutes=360))
+df["temp_diff_vs_5hr"] = temperatures_arr - _temp_lag300
+df["temp_diff_vs_6hr"] = temperatures_arr - _temp_lag360
 print("   ✅ Lags computed")
 
 # Future targets for backfilling actuals
 print("⚙️  Building future temperature targets...")
-temperatures_arr = df["temperature"].values.astype(np.float32)
 df["temp_t+1hr"] = _future_temp_at(df.index, temperatures_arr, pd.Timedelta(hours=1))
 df["temp_t+2hr"] = _future_temp_at(df.index, temperatures_arr, pd.Timedelta(hours=2))
 df["temp_t+3hr"] = _future_temp_at(df.index, temperatures_arr, pd.Timedelta(hours=3))

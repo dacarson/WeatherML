@@ -1,3 +1,16 @@
+import os
+
+# QAT fine-tuning flag — declared here, before the TensorFlow import, because tfmot's default
+# quantization scheme cannot recognize Keras 3 Functional models at all ("to_quantize can only
+# be a Sequential or Functional model" even though it is one). TF_USE_LEGACY_KERAS must be set
+# before `import tensorflow` for tf.keras to resolve to the legacy tf_keras engine tfmot
+# expects; setting it after import has no effect. This mirrors QAT_FINE_TUNE in the config
+# block below (kept in sync manually — that block is the source of truth for QAT_LR/EPOCHS/etc,
+# this line only exists early enough to gate the env var).
+QAT_FINE_TUNE = False
+if QAT_FINE_TUNE:
+    os.environ["TF_USE_LEGACY_KERAS"] = "1"
+
 import tensorflow as tf
 
 # Model 5c Track B: TFT-Informed Dense Model for Coral Edge TPU
@@ -23,38 +36,83 @@ KAGGLE_DATASET = "datasets/dacarson/weatherml-training-data"
 KAGGLE_CHECKPOINT_DATASET = ""
 KAGGLE_CHECKPOINT_SUBDIR = ""
 
-RUN_NAME = "dense_b_run14"
+# Diagnostic audit (not a training run): loads a checkpoint read-only, compares each
+# intermediate tensor's REAL activation range (from a forward pass on real validation data)
+# against what its already-exported .tflite calibrated as that tensor's INT8 range, then exits
+# before touching training/export. Used to hunt for other forced/mismatched-range precision
+# losses like the wide/deep_out concat one found and fixed in Run 20. Set RUN_NAME/
+# SOURCE_CHECKPOINT below to point at whichever run's checkpoint+tflite pair to audit.
+DIAGNOSTIC_AUDIT = False
+
+RUN_NAME = "dense_b_run22"
 RESULTS_DIR = f"/kaggle/working" if KAGGLE_MODE else f"./results_5c_trackb_{RUN_NAME}"
+AUDIT_SOURCE_RUN_DIR = "./results_5c_trackb_dense_b_run22"
 
-# Run 14: fuse Dense + Activation("relu6") into a single op via Dense(n, activation="relu6").
-# Hypothesis: TFLite may not fuse separate Dense → Activation("relu6") Keras layers, leaving
-# the intermediate pre-activation tensor quantized with an unbounded scale. Using the activation
-# in the Dense constructor tells Keras to emit a single FULLY_CONNECTED op, so TFLite quantizes
-# only the post-activation [0,6]-bounded output. Fresh training required — layer name graph
-# changes (Activation layers removed) make Run 11/13 checkpoints incompatible.
-SKIP_TRAINING = False
-SOURCE_CHECKPOINT = ""  # unused when SKIP_TRAINING=False
+# Run 22: re-implement Run 21's deep_out ceiling tightening WITHOUT introducing new unfused
+# ops. Run 21's post-hoc audit found ReLU(max_value=0.6) worked exactly as intended for the
+# main activation path (99.2% utilization) but its clip_by_value decomposition created a
+# SEPARATE, badly-calibrated tensor (28% utilization, calibrated max 4x the real max) — net
+# result was WORSE INT8 on 2hr/3hr despite fixing the originally-diagnosed problem. Verified
+# directly (standalone conversion test) that a Lambda(tf.clip_by_value(...)) has the exact same
+# duplicate-tensor issue — it's not specific to the ReLU layer, clip_by_value itself decomposes
+# this way under TFLite's MLIR lowering.
+#
+# Fix: achieve the same effective tighter ceiling using only well-fusing ops. Pre-scale UP
+# before the EXISTING relu6 (native TFLite op, unlike generic clip_by_value) so relu6's fixed
+# ceiling of 6 lands close to where the real distribution's tail actually sits, then rescale
+# back down afterward to match wide's range for the concat (as Run 20 already did). Verified
+# directly: Dense(linear) -> Rescaling(prescale) -> Activation("relu6") -> Rescaling(downscale)
+# converts to exactly 2 clean tensors — TFLite's converter even algebraically folds the
+# Rescaling multiply INTO the preceding MatMul, fusing MatMul+prescale+Relu6 into a single
+# quantized tensor, plus one clean tensor for the final downscale. No duplicate/mismatched
+# tensors, unlike both Run 21 approaches tested.
+SKIP_TRAINING = True if DIAGNOSTIC_AUDIT else False
+SOURCE_CHECKPOINT = (f"{AUDIT_SOURCE_RUN_DIR}/checkpoints/best_model.weights.h5" if DIAGNOSTIC_AUDIT
+                     else "./results_5c_trackb_dense_b_run18/checkpoints/best_model.weights.h5")
 
-# Architecture — Run 14: fused Dense+ReLU6 ops throughout (INT8 fix hypothesis)
-#   All runs 6–13 used Dense(n) → Activation("relu6") as separate layers. TFLite may quantize
-#   the intermediate pre-activation tensor with an unbounded scale, preventing accurate INT8.
-#   Run 14 fuses all pairs into Dense(n, activation="relu6") so TFLite sees a single
-#   FULLY_CONNECTED op and quantizes only the post-activation [0,6]-bounded output.
-#   Input:      (180, 11) — 3hr temporal window, 11 features (unchanged from Run 11)
-#   AvgPool:    AveragePooling1D(pool_size=6) → (30, 11) → Reshape(330)
-#   Bottleneck: Dense(64, activation="relu6")          ← was Dense(64) → Activation("relu6")
-#   Wide path:  Dense(16, activation="relu6")           ← was Dense(16) → Activation("relu6")
-#   Deep path:  Dense(128, activation="relu6")          ← was Dense(128) → Activation("relu6")
-#               → Dense(64, activation="relu6")         (already fused in Run 11)
-#               → Dense(32, activation="relu6")         (already fused in Run 11)
+# Warm start: initialize weights from a prior run's checkpoint instead of random init, while
+# keeping training otherwise fresh (optimizer state, LR schedule, early-stopping all reset).
+# Only valid when architecture/feature shapes are unchanged from the source run. Applies only
+# on this run's own first invocation (no checkpoint of its own yet) — a genuine resume of THIS
+# run (model_latest.weights.h5 in this run's own RESULTS_DIR) always takes priority.
+# Run 22: warm start from Run 20, NOT Run 21 — Run 21's deep_out weights were trained under a
+# constraint (ReLU max_value=0.6) we're now abandoning; Run 20's plain-relu6 weights are the
+# right starting point for this new pre/post-rescale design, and _ws_model below already
+# matches Run 20's exact architecture unmodified (reused as-is, no changes needed this time).
+WARM_START = True
+WARM_START_CHECKPOINT = "./results_5c_trackb_dense_b_run20/checkpoints/best_model.weights.h5"
+
+# Pre-scale applied to deep_out's linear output BEFORE relu6 (Run 22). Chosen so relu6's fixed
+# ceiling of 6 corresponds to the same effective 0.6 target Run 21 used directly: 6 / 0.6 = 10.
+DEEP_OUT_PRESCALE = 10.0
+
+# Rescale applied to deep_out's output AFTER relu6, before the concat (Run 20's original
+# purpose: match wide's calibrated range, ~1.6-1.8 per the Run 20/21 audits). Since relu6's
+# ceiling is now effectively 6 (post-prescale), target ~1.6/6 ≈ 0.27 instead of Run 20/21's
+# >1 multiplier (which rescaled directly from the old ~0.5-max linear space).
+DEEP_OUT_RESCALE = 0.2735
+
+# QAT fine-tuning — active when SKIP_TRAINING=True + QAT_FINE_TUNE=True.
+# QAT_FINE_TUNE itself is declared at the top of the file (before `import tensorflow`) since
+# TF_USE_LEGACY_KERAS must be set before that import to take effect — see comment there.
+QAT_LR = 1e-6       # safe without warmup: gradient amplification = lr/eps = 10× (vs 1000× at Run 12's 1e-4)
+QAT_EPOCHS = 50
+QAT_EARLY_STOP_PATIENCE = 10
+
+# Architecture — Run 16: same as Run 14/15 (fused Dense+ReLU6), fresh training with 2 new
+#   features (temp_diff_vs_5hr, temp_diff_vs_6hr — see MODEL_5C_TRACK_B_EXPERIMENT_LOG.md).
+#   Input:      (180, 13) — 3hr temporal window, 13 features
+#   AvgPool:    AveragePooling1D(pool_size=6) → (30, 13) → Reshape(390)
+#   Bottleneck: Dense(64, activation="relu6")
+#   Wide path:  Dense(16, activation="relu6")
+#   Deep path:  Dense(128, activation="relu6") → Dense(64, activation="relu6")
+#               → Dense(32, activation="relu6")
 #   Merge:      Concat(16+32=48) → 3 output heads
-#   No BN (Run 11): BN γ unconstrained by L2, produces wide pre-clip activation range → INT8 scale issue
-#   No residual (Run 10): Add layer produced unbounded INT8 tensors → +547/909/1036% degradation
-#   No interaction path: element-wise square caused +810% INT8 degradation in Run 6; removed Run 7
+#   No BN, No residual, No interaction path — same constraints as Runs 11–14
 L2_REG = 1e-6
 
 # Training
-MAX_EPOCHS = 300
+MAX_EPOCHS = 600
 INITIAL_LR = 1e-4
 REDUCE_LR_PATIENCE = 12
 REDUCE_LR_FACTOR = 0.5
@@ -127,6 +185,9 @@ def main():
 
     tf.config.set_soft_device_placement(True)
 
+    # on_metal is a pure hardware-detection flag (physically running on Metal GPU) — it drives
+    # the XLA JIT decision below and must stay accurate regardless of QAT, since Metal's
+    # PluggableDevice backend can't do XLA JIT compilation no matter what precision is used.
     on_metal = (bool(physical_devices) and not force_cpu and not KAGGLE_MODE)
     if KAGGLE_MODE or force_cpu:
         tf.config.optimizer.set_jit(True)
@@ -138,10 +199,18 @@ def main():
         tf.config.optimizer.set_jit(True)
         print("ℹ️  XLA JIT enabled (CPU)")
 
+    # use_mixed_precision is the separate "should this run use fp16 compute" decision — distinct
+    # from on_metal because QAT requires float32 (tfmot fake-quant nodes are incompatible with
+    # fp16 compute graphs) even though the hardware is still physically Metal.
+    use_mixed_precision = on_metal
+    if QAT_FINE_TUNE and use_mixed_precision:
+        use_mixed_precision = False
+        print("ℹ️  QAT_FINE_TUNE=True: mixed precision disabled (float32 required for tfmot)")
+
     # Mixed precision: fp16 compute on Metal GPU.
     # Safe for Dense models (no attention/softmax numerical issues that affect TFT).
     # Output layers use dtype='float32' explicitly so targets stay FP32.
-    if on_metal:
+    if use_mixed_precision:
         tf.keras.mixed_precision.set_global_policy("mixed_float16")
         print("ℹ️  Mixed precision enabled: fp16 compute / fp32 master weights (Metal GPU)")
 
@@ -184,6 +253,27 @@ def main():
         df = df.set_index(time_col).sort_index()
         if df.index.has_duplicates:
             df = df[~df.index.duplicated(keep="last")]
+        return df
+
+    def _sanity_filter_temperature(df, label, window="31min", threshold_c=6.0):
+        # Raw station data contains rare sensor-glitch rows (brief dropout/self-heating,
+        # not real weather) where temperature jumps implausibly fast and reverts a few
+        # minutes later — e.g. 2023-01-23 09:18 UTC: 11.1°C -> -7.5°C -> 9.9°C with
+        # relative_humidity simultaneously collapsing to 0%. These poisoned the
+        # temp_diff_Nhr targets (e.g. -31.5°C global min) since diffs are computed via
+        # merge_asof against raw 'temperature'. Null any reading that deviates from its
+        # local (time-centered) median by more than threshold_c; downstream dropna
+        # removes the row entirely. Found via `git log` discussion 2026-07-19.
+        if not isinstance(df.index, pd.DatetimeIndex):
+            return df
+        df = df.copy()
+        local_median = df["temperature"].rolling(window, center=True, min_periods=3).median()
+        spike = (df["temperature"] - local_median).abs() > threshold_c
+        n_spikes = int(spike.sum())
+        if n_spikes:
+            df.loc[spike, "temperature"] = np.nan
+            print(f"⚠️  {label}: nulled {n_spikes} temperature sensor-glitch rows "
+                  f"(>{threshold_c}°C from local {window} median)")
         return df
 
     def _add_future_targets(df, label, tolerance_s=90):
@@ -242,6 +332,37 @@ def main():
             print(f"✅ {label}: no cross-gap target contamination")
         return df
 
+    def _add_past_lags(df, label, tolerance_s=90):
+        # temp_diff_vs_5hr / temp_diff_vs_6hr: from the Track A Deep Run (SEQ_LEN=360) finding
+        # of a genuine non-boundary attention anchor at ~5 hours (t-295 to t-301). Track B's
+        # SEQ_LEN=180 window can't see that far back, so this is carried in as a scalar feature.
+        if all(c in df.columns for c in ["temp_diff_vs_5hr", "temp_diff_vs_6hr"]):
+            return df
+        if "temperature" not in df.columns:
+            raise ValueError(f"{label}: missing 'temperature'")
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError(f"{label}: need DatetimeIndex for lag construction")
+        base = df.reset_index()
+        if "time" not in base.columns:
+            base = base.rename(columns={base.columns[0]: "time"})
+        base["time"] = pd.to_datetime(base["time"], utc=True, errors="coerce")
+        base = base.sort_values("time").reset_index(drop=True)
+        base["row_id"] = np.arange(len(base), dtype=np.int64)
+        src = base[["time", "temperature"]].copy().rename(columns={"temperature": "temperature_past"})
+        tol = pd.Timedelta(seconds=int(tolerance_s))
+        for mins, col in ((300, "temp_lag_300"), (360, "temp_lag_360")):
+            want = base[["row_id", "time"]].copy()
+            want["t_query"] = want["time"] - pd.Timedelta(minutes=int(mins))
+            merged = pd.merge_asof(want.sort_values("t_query"), src,
+                                   left_on="t_query", right_on="time",
+                                   direction="backward", tolerance=tol)
+            base[col] = merged.sort_values("row_id")["temperature_past"].to_numpy()
+        base["temp_diff_vs_5hr"] = base["temperature"] - base["temp_lag_300"]
+        base["temp_diff_vs_6hr"] = base["temperature"] - base["temp_lag_360"]
+        print(f"\n❓ Missing 5hr/6hr lag counts for {label}:")
+        print(base[["temp_diff_vs_5hr", "temp_diff_vs_6hr"]].isna().sum())
+        return base.drop(columns=["row_id", "temp_lag_300", "temp_lag_360"]).set_index("time")
+
 
     # -------------------------------------------------------------------------
     # Load data
@@ -254,12 +375,27 @@ def main():
     train_df = pd.read_csv(f"{data_dir}/train_data_sf.csv")
     val_df = pd.read_csv(f"{data_dir}/val_data_sf.csv")
 
+    # The raw CSVs ship with pre-baked temp_t+1hr/2hr/3hr columns from an earlier export
+    # pipeline. _add_future_targets() short-circuits (returns df unchanged) whenever those
+    # columns already exist, so keeping them means the sanity filter below (and the
+    # gap-aware merge_asof reconstruction in _add_future_targets/_invalidate_targets_
+    # crossing_gaps) never actually run — targets stay locked to whatever that external
+    # pipeline computed, including any of its own bad readings. Drop them so targets are
+    # always freshly derived from (now sanity-filtered) 'temperature'.
+    _stale_target_cols = ["temp_t+1hr", "temp_t+2hr", "temp_t+3hr"]
+    train_df = train_df.drop(columns=[c for c in _stale_target_cols if c in train_df.columns])
+    val_df = val_df.drop(columns=[c for c in _stale_target_cols if c in val_df.columns])
+
     train_df = _prepare_time_index(train_df, "train_df")
     val_df = _prepare_time_index(val_df, "val_df")
+    train_df = _sanity_filter_temperature(train_df, "train_df")
+    val_df = _sanity_filter_temperature(val_df, "val_df")
     train_df = _add_future_targets(train_df, "train_df")
     val_df = _add_future_targets(val_df, "val_df")
     train_df = _invalidate_targets_crossing_gaps(train_df, "train_df", tol_s=600)
     val_df = _invalidate_targets_crossing_gaps(val_df, "val_df", tol_s=600)
+    train_df = _add_past_lags(train_df, "train_df")
+    val_df = _add_past_lags(val_df, "val_df")
 
     # -------------------------------------------------------------------------
     # Cyclical encodings (identical to Track A)
@@ -329,20 +465,23 @@ def main():
         # pressure_slope_60's 60-row window already excludes all rows solar_slope_30 would.
         "temp_diff_1hr", "temp_diff_2hr", "temp_diff_3hr",
         # temp_slope_15/30/60 not features; first 60 rows still excluded by pressure_slope_60
+        "temp_diff_vs_5hr", "temp_diff_vs_6hr",  # Run 16: drop rows without 5hr/6hr history
     ]
     train_df.dropna(subset=_dropna_cols, inplace=True)
     val_df.dropna(subset=_dropna_cols, inplace=True)
     print(f"\nAfter dropna: train={len(train_df):,} rows, val={len(val_df):,} rows")
 
     # -------------------------------------------------------------------------
-    # Feature list — Track B Run 11
+    # Feature list — Track B Run 16
     #
+    # Run 16: 13 features. Added temp_diff_vs_5hr/6hr from Track A Deep Run non-boundary
+    #         attention anchor (~5hr) — see MODEL_5C_TRACK_B_EXPERIMENT_LOG.md.
     # Run 11: 11 features. Removed BatchNorm (INT8 fix — BN γ unconstrained by L2).
     #         Dropped humidity_slope_30 (negative perm in Runs 7, 8, 9, 10 — 4 consecutive).
     # Run 10: 12 features. Removed residual Add from Deep path (INT8 fix).
     #         Dropped station_pressure (negative perm importance in 5 consecutive runs).
     # Run 9:  13 features. Wide path ReLU6 added; dropped solar_slope_30.
-    # AveragePooling1D(pool_size=6) compresses (180, 11) → (30, 11) → Reshape(330).
+    # AveragePooling1D(pool_size=6) compresses (180, n_features) → (30, n_features) → Reshape.
     #
     # Run 10 perm importance (val_loss increase):
     #   time_of_day_cos (+0.0124), sin (+0.0104) — temporal dominant
@@ -357,6 +496,8 @@ def main():
     ]
     temperature_features = [
         "temperature",           # essential — Run 7 proved joint necessity of temperature signal
+        "temp_diff_vs_5hr",      # Run 16: Track A Deep Run non-boundary attention anchor (~5hr)
+        "temp_diff_vs_6hr",      # Run 16: Track A Deep Run window-boundary anchor (~6hr)
     ]
     humidity_features = [
         # relative_humidity: dropped — confirmed harmful in Runs 2, 4, 5, 6, 7 (5 consecutive runs)
@@ -390,6 +531,21 @@ def main():
         "temp_slope_30":      (None, None),
         "temp_slope_60":      (None, None),
         "solar_slope_30":     (None, None),
+        # Run 17: tightened from (None, None) (data-derived min/max ± 5% pad, ~-19/+23) to fixed
+        # ~1st/99th-percentile bounds — INT8 fix (Option 1). Run 16 measured these features'
+        # actual distribution: std ~3.6-4.0°C, IQR ~[-2, 2]°C, but min/max span ~40°C — min-max
+        # scaling wasted most of INT8's 256 levels on rarely-visited tails, and temp_diff_vs_5hr
+        # is the model's single most important feature (perm importance 0.0456), so quantization
+        # noise there had an outsized effect (INT8 MAE 7-11x worse than FP32).
+        # Run 17 correction: initially left the ~2% of out-of-bounds values unclipped, assuming
+        # they'd "saturate naturally at INT8 export" — wrong. The exported model's single
+        # 'input' tensor uses ONE shared per-tensor INT8 scale across all 13 channels, so any
+        # unclipped excursion (measured: temp_diff_vs_5hr reached -0.45/+1.475 in scaled units,
+        # 1.7% of rows) stretches that shared scale for every channel, not just its own —
+        # undercutting most of the resolution gain the tighter bounds were meant to buy. Run 18
+        # adds explicit .clip(0,1) below to fix this. See MODEL_5C_TRACK_B_EXPERIMENT_LOG.md Run 18.
+        "temp_diff_vs_5hr":   (-8, 12),
+        "temp_diff_vs_6hr":   (-9, 13),
         "relative_humidity":  (0, 100),
         "humidity_slope_30":  (None, None),
         "pressure_slope_60":  (None, None),
@@ -416,8 +572,12 @@ def main():
         lo = floor if floor is not None else f_min - pad
         hi = ceiling if ceiling is not None else f_max + pad
         input_scaler[feat] = {"min": lo, "max": hi}
-        X_train_df[feat] = (X_train_df[feat] - lo) / (hi - lo)
-        X_val_df[feat] = (X_val_df[feat] - lo) / (hi - lo)
+        # Run 18: explicit clip to [0,1] — the exported model's 'input' tensor uses one shared
+        # per-tensor INT8 scale across all 13 channels, so any unclipped excursion (previously:
+        # temp_diff_vs_5hr/6hr reaching -0.45/+1.475, ~1.7% of rows) stretches that shared scale
+        # for every channel, not just its own. See MODEL_5C_TRACK_B_EXPERIMENT_LOG.md Run 18.
+        X_train_df[feat] = ((X_train_df[feat] - lo) / (hi - lo)).clip(0.0, 1.0)
+        X_val_df[feat] = ((X_val_df[feat] - lo) / (hi - lo)).clip(0.0, 1.0)
 
     X_train_flat = X_train_df.values.astype(np.float32)
     X_val_flat = X_val_df.values.astype(np.float32)
@@ -449,7 +609,7 @@ def main():
 
     n_features = len(features)
     # SEQ_LEN=180: full 3hr temporal window. AveragePooling1D(pool_size=6) compresses
-    # (180, 18) → (30, 18) → flatten(540) before the Dense bottleneck.
+    # (180, n_features) → (30, n_features) → flatten before the Dense bottleneck.
     SEQ_LEN = 180
 
     y_all_train = train_df[targets].values.astype(np.float32)
@@ -588,11 +748,13 @@ def main():
         def on_epoch_end(self, epoch, logs=None):
             if logs is None:
                 return
-            keys = ("val_diff_1hr_loss", "val_diff_2hr_loss", "val_diff_3hr_loss")
-            if all(k in logs for k in keys):
-                logs["val_task_loss"] = sum(logs[k] for k in keys)
-            else:
-                logs["val_task_loss"] = logs.get("val_loss", float("inf"))
+            # Support normal ("val_diff_Xhr_loss") and QAT ("val_quant_diff_Xhr_loss") output names.
+            for prefix in ("", "quant_"):
+                keys = tuple(f"val_{prefix}diff_{h}hr_loss" for h in (1, 2, 3))
+                if all(k in logs for k in keys):
+                    logs["val_task_loss"] = sum(logs[k] for k in keys)
+                    return
+            logs["val_task_loss"] = logs.get("val_loss", float("inf"))
 
     class NaNLossTerminator(Callback):
         def on_train_batch_end(self, batch, logs=None):
@@ -827,8 +989,26 @@ def main():
                                      name="deep1", kernel_regularizer=_reg())(bottleneck)
         deep = tf.keras.layers.Dense(64, activation="relu6", use_bias=False,
                                      name="deep2", kernel_regularizer=_reg())(deep)
-        deep_out = tf.keras.layers.Dense(32, activation="relu6", use_bias=False,
+        # Run 22: deep_out's own ceiling tightened WITHOUT unfused custom-clip ops (Run 21's
+        # ReLU(max_value=X) fixed the main activation path but its clip_by_value decomposition
+        # introduced a separate badly-calibrated tensor — net worse on 2hr/3hr). Instead:
+        # pre-scale up before relu6 (a native, single-op TFLite activation) so its fixed ceiling
+        # of 6 lands close to the real distribution's tail (Run 20 audit: real max 0.4988,
+        # p99.9=0.3555), then rescale back down to match wide's range for the concat. Verified
+        # directly: this converts to 2 clean tensors, no duplicates — TFLite even folds the
+        # prescale Mul into the preceding MatMul, fusing MatMul+prescale+Relu6 into one tensor.
+        deep_out = tf.keras.layers.Dense(32, use_bias=False,
                                          name="deep_out", kernel_regularizer=_reg())(deep)
+        deep_out = tf.keras.layers.Rescaling(scale=DEEP_OUT_PRESCALE, name="deep_out_prescale")(deep_out)
+        deep_out = tf.keras.layers.Activation("relu6", name="deep_out_relu6")(deep_out)
+
+        # Run 20: rescale deep_out before the concat. TFLite's concat op forces both concat
+        # inputs to share ONE INT8 scale; deep_out's activations run at roughly a third of
+        # wide's magnitude (Run 20 audit: wide real max 1.7676 vs deep_out real max 0.4988), so
+        # the forced shared scale was wasting most of deep_out's effective resolution. This
+        # fixed, untrained multiply brings both branches to a similar range; no weights, so it's
+        # free at inference and a single MUL op that TFLite quantizes cleanly.
+        deep_out = tf.keras.layers.Rescaling(scale=DEEP_OUT_RESCALE, name="deep_out_rescale")(deep_out)
 
         # Merge: 16 + 32 = 48 dims
         merged = tf.keras.layers.Concatenate(name="merged")([wide, deep_out])
@@ -853,7 +1033,10 @@ def main():
     model.summary()
     print(f"\nArchitecture: avgpool(6)→flat({SEQ_LEN // 6 * n_features}) → bottleneck(64,ReLU6) → wide(16,ReLU6) + deep(128→ReLU6→64→ReLU6→32→ReLU6) → merge(48)")
     print(f"SEQ_LEN: {SEQ_LEN}, n_features: {n_features}, L2_REG: {L2_REG}")
-    print(f"Run 14: fused Dense(activation='relu6') throughout — fresh training (INT8 op-fusion hypothesis)")
+    if QAT_FINE_TUNE and SKIP_TRAINING:
+        print(f"QAT fine-tuning from {SOURCE_CHECKPOINT} — LR={QAT_LR:.0e}, max {QAT_EPOCHS} epochs, patience {QAT_EARLY_STOP_PATIENCE}")
+    else:
+        print(f"Run 18: clip scaled inputs to [0,1] (INT8 fix continued) — max {MAX_EPOCHS} epochs")
 
     # -------------------------------------------------------------------------
     # Checkpoint loading
@@ -864,16 +1047,143 @@ def main():
     lr_state_path = os.path.join(checkpoint_dir, "lr_state.json")
     initial_epoch = 0
 
-    # SKIP_TRAINING path: load weights from SOURCE_CHECKPOINT and bypass training.
+    # Warm start: only on this run's own first invocation (no checkpoint of its own yet).
+    # Weight shapes must match exactly (architecture/feature count unchanged from the source
+    # run) — deliberately NOT using skip_mismatch here, so a real shape mismatch fails loudly
+    # instead of silently warm-starting a subset of layers.
+    #
+    # NOT using plain model.load_weights(WARM_START_CHECKPOINT) directly into `model`: verified
+    # directly that Keras 3's native .weights.h5 format does NOT key its H5 groups by layer
+    # .name at all — it uses auto-generated dense/dense_1/... keys based on model.layers'
+    # internal topological order, which is NOT simply Python call order (confirmed: a layer
+    # built earlier in code can appear later in model.layers depending on graph shape). Run 20
+    # inserted `Rescaling` after deep_out — a weightless layer — which was enough to reorder
+    # `wide` and `deep_out` relative to each other in that traversal, silently swapping their
+    # loaded weights when using plain load_weights(). by_name isn't even a valid kwarg for this
+    # format. Fix: build the WARM_START_CHECKPOINT's own (unmodified) architecture, load into
+    # THAT (guaranteed correct — identical topology to what was saved), then copy weights
+    # across by layer .name in Python, which IS reliable (unlike the H5 group keys).
+    #
+    # IMPORTANT — this block must be kept in exact topological sync with whatever architecture
+    # actually PRODUCED WARM_START_CHECKPOINT, not the current run's architecture: even a
+    # weightless layer (Rescaling, ReLU) changes the auto-generated H5 group-key ordering (Run
+    # 21 hit this directly — WARM_START_CHECKPOINT=Run 20, which included Rescaling; this block
+    # had been left at Run 18's pre-Rescaling shape and failed the same way Run 20's first
+    # attempt did). The Rescaling `scale=` value below is irrelevant to correctness (the layer
+    # has no weights either way) — only its topological presence/position matters.
+    if not SKIP_TRAINING and WARM_START:
+        _own_latest = os.path.join(checkpoint_dir, "model_latest.weights.h5")
+        _own_best = os.path.join(checkpoint_dir, "best_model.weights.h5")
+        if not os.path.exists(_own_latest) and not os.path.exists(_own_best):
+            if os.path.exists(WARM_START_CHECKPOINT):
+                _ws_inp  = tf.keras.layers.Input(shape=(SEQ_LEN, n_features), name="input")
+                _ws_pool = tf.keras.layers.AveragePooling1D(pool_size=6, strides=6, name="avgpool")(_ws_inp)
+                _ws_flat = tf.keras.layers.Reshape((SEQ_LEN // 6 * n_features,), name="flatten")(_ws_pool)
+                _ws_bn   = tf.keras.layers.Dense(64, activation="relu6", use_bias=False, name="bottleneck")(_ws_flat)
+                _ws_wide = tf.keras.layers.Dense(16, activation="relu6", use_bias=False, name="wide")(_ws_bn)
+                _ws_d    = tf.keras.layers.Dense(128, activation="relu6", use_bias=False, name="deep1")(_ws_bn)
+                _ws_d    = tf.keras.layers.Dense(64, activation="relu6", use_bias=False, name="deep2")(_ws_d)
+                _ws_dout = tf.keras.layers.Dense(32, activation="relu6", use_bias=False, name="deep_out")(_ws_d)
+                _ws_dout = tf.keras.layers.Rescaling(scale=1.0, name="deep_out_rescale")(_ws_dout)
+                _ws_mg   = tf.keras.layers.Concatenate(name="merged")([_ws_wide, _ws_dout])
+                _ws_o1 = tf.keras.layers.Dense(1, use_bias=False, dtype="float32", name="diff_1hr")(_ws_mg)
+                _ws_o2 = tf.keras.layers.Dense(1, use_bias=False, dtype="float32", name="diff_2hr")(_ws_mg)
+                _ws_o3 = tf.keras.layers.Dense(1, use_bias=False, dtype="float32", name="diff_3hr")(_ws_mg)
+                _ws_model = tf.keras.Model(inputs=_ws_inp, outputs=[_ws_o1, _ws_o2, _ws_o3])
+                _ws_model.load_weights(WARM_START_CHECKPOINT)
+                _ws_names = {l.name for l in _ws_model.layers}
+                _copied = []
+                for _l in model.layers:
+                    if _l.name in _ws_names and _l.get_weights():
+                        _l.set_weights(_ws_model.get_layer(_l.name).get_weights())
+                        _copied.append(_l.name)
+                print(f"✅ Warm-started {len(_copied)} layers by name from {WARM_START_CHECKPOINT}: "
+                      f"{_copied} (fresh optimizer/LR/early-stopping — not a resume)")
+            else:
+                print(f"⚠️  WARM_START_CHECKPOINT not found: {WARM_START_CHECKPOINT} — using random init")
+
+    # SKIP_TRAINING path: load weights from SOURCE_CHECKPOINT.
+    # Keras 3 native ".weights.h5" format: load_weights() has no by_name kwarg (that's a
+    # legacy TF1/Keras2 HDF5-only argument). skip_mismatch=True is still valid and kept as a
+    # safety net in case SOURCE_CHECKPOINT is ever retargeted to a run with different shapes.
     if SKIP_TRAINING:
         if os.path.exists(SOURCE_CHECKPOINT):
-            model.load_weights(SOURCE_CHECKPOINT)
-            initial_epoch = MAX_EPOCHS  # forces the training block to be skipped
+            model.load_weights(SOURCE_CHECKPOINT, skip_mismatch=True)
             print(f"✅ Loaded source checkpoint: {SOURCE_CHECKPOINT}")
-            print(f"   Training skipped (SKIP_TRAINING=True)")
+            if QAT_FINE_TUNE:
+                print(f"   QAT fine-tuning will run (initial_epoch stays 0)")
+            else:
+                initial_epoch = MAX_EPOCHS  # forces the training block to be skipped
+                print(f"   Training skipped (SKIP_TRAINING=True, QAT_FINE_TUNE=False)")
         else:
             raise FileNotFoundError(
                 f"SKIP_TRAINING=True but SOURCE_CHECKPOINT not found: {SOURCE_CHECKPOINT}")
+
+    if DIAGNOSTIC_AUDIT:
+        print("\n" + "=" * 60)
+        print("🔬 DIAGNOSTIC AUDIT — real activation range vs exported INT8 calibration")
+        print("=" * 60)
+        # Use the SAME random-sampling methodology as representative_data_gen (not X_val_small's
+        # deterministic, chronologically-contiguous first-2000-windows slice) — a biased sample
+        # could itself produce a spuriously low utilization reading, and the whole point of this
+        # audit is to tell that apart from a genuine long-tail calibration mismatch.
+        _n_audit = X_val_flat.shape[0] - SEQ_LEN + 1
+        _audit_idxs = np.random.choice(_n_audit, size=min(5000, _n_audit), replace=False)
+        X_val_random = np.stack([X_val_flat[j:j + SEQ_LEN] for j in _audit_idxs])
+
+        _probe_names = ["bottleneck", "wide", "deep1", "deep2", "deep_out", "deep_out_prescale",
+                         "deep_out_relu6", "deep_out_rescale", "merged",
+                         "diff_1hr", "diff_2hr", "diff_3hr"]
+        _probe_names = [n for n in _probe_names if n in [l.name for l in model.layers]]
+        probe_model = tf.keras.Model(
+            inputs=model.input,
+            outputs=[model.get_layer(n).output for n in _probe_names])
+        _probe_out = probe_model.predict(X_val_random, batch_size=VAL_BATCH_SIZE, verbose=0)
+        _real_ranges = {n: (float(np.min(o)), float(np.max(o)))
+                         for n, o in zip(_probe_names, _probe_out)}
+        _percentiles = {n: np.percentile(o, [50, 95, 99, 99.9, 100])
+                        for n, o in zip(_probe_names, _probe_out)}
+
+        _audit_tflite_path = f"{AUDIT_SOURCE_RUN_DIR}/model_trackb_{os.path.basename(AUDIT_SOURCE_RUN_DIR).replace('results_5c_trackb_', '')}_int8.tflite"
+        if not os.path.exists(_audit_tflite_path):
+            print(f"⚠️  No exported INT8 tflite found at {_audit_tflite_path} — "
+                  f"printing real ranges only, no calibration comparison.")
+            for n, (lo, hi) in _real_ranges.items():
+                print(f"  {n:20s} real=[{lo:8.4f}, {hi:8.4f}]")
+        else:
+            _interp = tf.lite.Interpreter(model_path=_audit_tflite_path)
+            _interp.allocate_tensors()
+            _tflite_ranges = {}
+            for d in _interp.get_tensor_details():
+                scale, zp = d["quantization"]
+                if scale == 0.0:
+                    continue
+                _tflite_ranges[d["name"]] = (scale * (-128 - zp), scale * (127 - zp))
+
+            print(f"{'tensor':20s} {'real_min':>10s} {'real_max':>10s}  "
+                  f"{'calib_min':>10s} {'calib_max':>10s}  {'util%':>7s}  matched_tflite_tensor")
+            for n, (rlo, rhi) in _real_ranges.items():
+                # Fuzzy match: find tflite tensor names containing this layer name.
+                _candidates = [k for k in _tflite_ranges if f"/{n}/" in k or k.endswith(f"/{n}")
+                               or f"{n}_1/" in k or f"{n}/" in k]
+                if not _candidates:
+                    print(f"  {n:20s} {rlo:10.4f} {rhi:10.4f}  {'?':>10s} {'?':>10s}  {'?':>7s}  (no match found)")
+                    continue
+                for c in _candidates:
+                    clo, chi = _tflite_ranges[c]
+                    span_r = rhi - rlo
+                    span_c = chi - clo
+                    util = 100.0 * span_r / span_c if span_c > 1e-9 else float("nan")
+                    flag = "  <-- LOW UTILIZATION" if util < 70.0 else ""
+                    print(f"  {n:20s} {rlo:10.4f} {rhi:10.4f}  {clo:10.4f} {chi:10.4f}  {util:6.1f}%  {c}{flag}")
+                    if util < 70.0:
+                        p50, p95, p99, p999, p100 = _percentiles[n]
+                        print(f"    {'':20s} percentiles: p50={p50:.4f} p95={p95:.4f} "
+                              f"p99={p99:.4f} p99.9={p999:.4f} p100(max)={p100:.4f}  "
+                              f"(n={_probe_out[_probe_names.index(n)].size} values, "
+                              f"{min(5000, _n_audit)} random 3hr windows)")
+        print("\n✅ Audit complete — exiting before training/export (DIAGNOSTIC_AUDIT=True)")
+        return
 
     _latest_weights = os.path.join(checkpoint_dir, "model_latest.weights.h5")
     _latest_meta = os.path.join(checkpoint_dir, "model_latest_epoch.json")
@@ -983,6 +1293,92 @@ def main():
     print("=" * 60)
 
     # -------------------------------------------------------------------------
+    # QAT — wrap base model with fake-quant nodes, prepare QAT fine-tuning
+    # -------------------------------------------------------------------------
+    qat_model = model  # default: base model (non-QAT training path uses this)
+    if QAT_FINE_TUNE and SKIP_TRAINING:
+        print("\n" + "=" * 60)
+        print("🔧 QAT WRAPPING")
+        print("=" * 60)
+        try:
+            import tensorflow_model_optimization as tfmot
+        except ImportError:
+            raise ImportError(
+                "tensorflow-model-optimization required for QAT: "
+                "pip install tensorflow-model-optimization")
+
+        print("\n🔍 Pre-QAT FP32 baseline (Run 18 weights):")
+        _pre_eval = model.evaluate(val_ds.take(20), verbose=0)
+        _pre_loss = float(_pre_eval[0])
+        scale_pre = (y_max - y_min) / 2.0
+        if len(_pre_eval) >= 7:
+            _pre_1hr = float(_pre_eval[4]) * scale_pre
+            _pre_2hr = float(_pre_eval[5]) * scale_pre
+            _pre_3hr = float(_pre_eval[6]) * scale_pre
+            print(f"   val_loss (pre-QAT FP32): {_pre_loss:.6f}")
+            print(f"   FP32 MAE: 1hr={_pre_1hr:.3f}°C  2hr={_pre_2hr:.3f}°C  3hr={_pre_3hr:.3f}°C")
+        else:
+            print(f"   val_loss (pre-QAT FP32): {_pre_loss:.6f}")
+        if _pre_loss >= 0.001:
+            raise RuntimeError(
+                f"Pre-QAT val_loss={_pre_loss:.6f} — Run 18 weights not loaded correctly "
+                f"(expected < 0.001). Check SOURCE_CHECKPOINT path.")
+
+        # tfmot's default QAT scheme has a hardcoded whitelist of supported activations
+        # ({linear, relu, swish, softmax, sigmoid, tanh, gelu}) — relu6 is not on it, fused
+        # or not (verified directly: quantize_apply raises "Only some Keras activations under
+        # `keras.activations` are supported" on this architecture as-is). Build a parallel
+        # relu-activated clone purely for QAT wrapping; weights transfer via get/set_weights
+        # since activation choice doesn't change kernel shapes (same technique already used
+        # for the FP32 export model below). QAT learns explicit per-tensor quantization ranges
+        # from calibration during fine-tuning, so relu6's hard clip-at-6 (which PTQ relied on)
+        # is not required the same way — untested assumption, but the only way to use tfmot's
+        # default (non-custom-QuantizeConfig) path with this architecture.
+        _q_inp  = tf.keras.layers.Input(shape=(SEQ_LEN, n_features), name="input")
+        _q_pool = tf.keras.layers.AveragePooling1D(pool_size=6, strides=6, name="avgpool")(_q_inp)
+        _q_flat = tf.keras.layers.Reshape((SEQ_LEN // 6 * n_features,), name="flatten")(_q_pool)
+        _q_bn   = tf.keras.layers.Dense(64, activation="relu", use_bias=False, name="bottleneck")(_q_flat)
+        _q_wide = tf.keras.layers.Dense(16, activation="relu", use_bias=False, name="wide")(_q_bn)
+        _q_d    = tf.keras.layers.Dense(128, activation="relu", use_bias=False, name="deep1")(_q_bn)
+        _q_d    = tf.keras.layers.Dense(64, activation="relu", use_bias=False, name="deep2")(_q_d)
+        _q_dout = tf.keras.layers.Dense(32, use_bias=False, name="deep_out")(_q_d)
+        _q_dout = tf.keras.layers.Rescaling(scale=DEEP_OUT_PRESCALE, name="deep_out_prescale")(_q_dout)
+        # NOTE: relu6 here would hit the same tfmot activation-whitelist issue Run 19 found for
+        # deep_out's original relu6 (tfmot's default scheme doesn't support relu6 at all) — this
+        # mirror is not verified QAT-compatible as-is; revisit if QAT is combined with Run 22.
+        _q_dout = tf.keras.layers.Activation("relu6", name="deep_out_relu6")(_q_dout)
+        # Run 20+: mirror the deep_out rescale from the training architecture (see model build
+        # above) — must match whatever DEEP_OUT_RESCALE the SOURCE_CHECKPOINT was trained with,
+        # or the weight transfer below will silently carry over a scale-mismatched deep_out.
+        _q_dout = tf.keras.layers.Rescaling(scale=DEEP_OUT_RESCALE, name="deep_out_rescale")(_q_dout)
+        _q_mg   = tf.keras.layers.Concatenate(name="merged")([_q_wide, _q_dout])
+        _q_o1 = tf.keras.layers.Dense(
+            1, activation="linear", use_bias=False, dtype="float32", name="diff_1hr")(_q_mg)
+        _q_o2 = tf.keras.layers.Dense(
+            1, activation="linear", use_bias=False, dtype="float32", name="diff_2hr")(_q_mg)
+        _q_o3 = tf.keras.layers.Dense(
+            1, activation="linear", use_bias=False, dtype="float32", name="diff_3hr")(_q_mg)
+        model_for_qat = tf.keras.Model(inputs=_q_inp, outputs=[_q_o1, _q_o2, _q_o3],
+                                       name=f"track_b_{RUN_NAME}_relu_for_qat")
+        model_for_qat.set_weights(model.get_weights())
+        print("ℹ️  Built relu-activated clone for QAT wrapping (tfmot does not support relu6); "
+              "weights copied from the relu6 model loaded from Run 18.")
+
+        qat_model = tfmot.quantization.keras.quantize_model(model_for_qat)
+        # Determine actual output names after QAT wrapping for metrics dict
+        _qat_out_names = [out.name.split("/")[0] for out in qat_model.outputs]
+        _qat_metrics = {name: "mae" for name in _qat_out_names}
+        qat_model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=QAT_LR, clipnorm=1.0),
+            loss="mse",
+            metrics=_qat_metrics,
+        )
+        print(f"\n✅ QAT model: {len(qat_model.layers)} layers (QuantizeWrapper applied)")
+        print(f"   Output names: {_qat_out_names}")
+        print(f"   Fine-tuning: LR={QAT_LR:.0e}, max={QAT_EPOCHS} epochs, "
+              f"patience={QAT_EARLY_STOP_PATIENCE}")
+
+    # -------------------------------------------------------------------------
     # Build callbacks
     # -------------------------------------------------------------------------
     early_stopping = EarlyStopping(monitor="val_task_loss", patience=EARLY_STOP_PATIENCE,
@@ -1033,7 +1429,38 @@ def main():
     # -------------------------------------------------------------------------
     # Training
     # -------------------------------------------------------------------------
-    if initial_epoch >= MAX_EPOCHS:
+    if QAT_FINE_TUNE and SKIP_TRAINING:
+        # -------------------------------------------------------------------------
+        # QAT fine-tuning (short, low-LR, early-stop patience=10)
+        # -------------------------------------------------------------------------
+        qat_checkpoint_dir = os.path.join(RESULTS_DIR, "qat_checkpoints")
+        os.makedirs(qat_checkpoint_dir, exist_ok=True)
+
+        qat_early_stopping = EarlyStopping(
+            monitor="val_task_loss", patience=QAT_EARLY_STOP_PATIENCE,
+            restore_best_weights=True, mode="min")
+
+        qat_callbacks = [
+            TaskLossLogger(),
+            NaNLossTerminator(),
+            qat_early_stopping,
+            LatestEpochSaver(qat_checkpoint_dir, initial_best=float("inf")),
+            EpochProgressCallback(log_every=10, total_steps=train_steps, max_epochs=QAT_EPOCHS),
+            TrainingWatchdog(timeout_minutes=10, check_interval_seconds=30,
+                             train_ds=train_ds, total_batches_hint=train_steps),
+        ]
+
+        print(f"\n🚀 QAT fine-tuning: up to {QAT_EPOCHS} epochs at LR={QAT_LR:.0e}, "
+              f"patience={QAT_EARLY_STOP_PATIENCE}")
+        history = qat_model.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=QAT_EPOCHS,
+            steps_per_epoch=train_steps,
+            callbacks=qat_callbacks,
+            verbose=0,
+        )
+    elif initial_epoch >= MAX_EPOCHS:
         print(f"\n✅ Already complete (epoch {initial_epoch} >= {MAX_EPOCHS})")
         history = None
     else:
@@ -1054,9 +1481,13 @@ def main():
     print("\n" + "=" * 60)
     print("📊 FINAL EVALUATION")
     print("=" * 60)
-    eval_results = model.evaluate(val_ds, verbose=0)
+    # QAT: evaluate the fine-tuned QAT model (FP32 accuracy may regress slightly vs Run 18 baseline).
+    # Non-QAT: evaluate the base model as usual.
+    eval_model = qat_model if (QAT_FINE_TUNE and SKIP_TRAINING) else model
+    eval_results = eval_model.evaluate(val_ds, verbose=0)
     # eval_results layout (Keras multi-output with per-output loss + MAE metric):
     #   [0] total_loss  [1] d1_mse  [2] d2_mse  [3] d3_mse  [4] d1_mae  [5] d2_mae  [6] d3_mae
+    # QAT: same layout; output names are quant_diff_Xhr but index positions are identical.
     val_loss = float(eval_results[0])
     scale = (y_max - y_min) / 2.0
     if len(eval_results) >= 7:
@@ -1078,15 +1509,24 @@ def main():
     print(f"  diff_3hr: {diff_3hr_mae_c:.3f}°C")
     print(f"\nval_loss (includes L2): {val_loss:.6f}")
 
-    # Weight verification: when loading an external checkpoint, confirm the model has the
-    # expected weights before proceeding to TFLite export.
+    # Weight verification: confirm weights are sane before TFLite export.
+    # QAT: FP32 may regress slightly from the Run 18 baseline (0.000450); threshold is loosened
+    # to 0.002 to allow for expected fine-tuning regression without blocking export.
     if SKIP_TRAINING:
-        if val_loss >= 0.001:
-            raise RuntimeError(
-                f"\n❌ WEIGHT VERIFICATION FAILED: val_loss={val_loss:.6f} "
-                f"(expected < 0.001 from {SOURCE_CHECKPOINT}).\n"
-                f"The checkpoint weights were not properly applied. Aborting before TFLite export.")
-        print(f"✅ Weight verification passed: val_loss={val_loss:.6f} (< 0.001 threshold)")
+        if QAT_FINE_TUNE:
+            if val_loss >= 0.002:
+                print(f"⚠️  Post-QAT val_loss={val_loss:.6f} — significant FP32 regression "
+                      f"(Run 18 baseline ~0.000450, threshold 0.002). Proceeding to export.")
+            else:
+                print(f"✅ Post-QAT weight check: val_loss={val_loss:.6f} "
+                      f"(Run 18 baseline ~0.000450)")
+        else:
+            if val_loss >= 0.001:
+                raise RuntimeError(
+                    f"\n❌ WEIGHT VERIFICATION FAILED: val_loss={val_loss:.6f} "
+                    f"(expected < 0.001 from {SOURCE_CHECKPOINT}).\n"
+                    f"The checkpoint weights were not properly applied. Aborting before TFLite export.")
+            print(f"✅ Weight verification passed: val_loss={val_loss:.6f} (< 0.001 threshold)")
 
     best_epoch = (initial_epoch + int(np.argmin(history.history["val_task_loss"]) + 1)
                   ) if history else initial_epoch
@@ -1099,7 +1539,8 @@ def main():
     y_perm = (y_val_small[:, 0], y_val_small[:, 1], y_val_small[:, 2])
     baseline_ds = tf.data.Dataset.from_tensor_slices(
         (X_perm, y_perm)).batch(VAL_BATCH_SIZE)
-    baseline_loss = float(model.evaluate(baseline_ds, verbose=0)[0])
+    _fi_model = qat_model if (QAT_FINE_TUNE and SKIP_TRAINING) else model
+    baseline_loss = float(_fi_model.evaluate(baseline_ds, verbose=0)[0])
 
     feature_importance = {}
     for fi, feat in enumerate(features):
@@ -1109,7 +1550,7 @@ def main():
         Xp[:, :, fi] = col
         perm_ds = tf.data.Dataset.from_tensor_slices(
             (Xp, y_perm)).batch(VAL_BATCH_SIZE)
-        perm_loss = float(model.evaluate(perm_ds, verbose=0)[0])
+        perm_loss = float(_fi_model.evaluate(perm_ds, verbose=0)[0])
         feature_importance[feat] = perm_loss - baseline_loss
 
     sorted_importance = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)
@@ -1125,7 +1566,7 @@ def main():
     # the float32 policy, copy weights (get_weights() returns fp32 master copies
     # even when the compute policy is fp16), then export that model.
     # -------------------------------------------------------------------------
-    if on_metal:
+    if use_mixed_precision:
         print("\n🔧 Building fp32 export model (casting mixed-precision weights)...")
         _orig_policy = tf.keras.mixed_precision.global_policy()
         tf.keras.mixed_precision.set_global_policy("float32")
@@ -1137,7 +1578,10 @@ def main():
         _e_wide = tf.keras.layers.Dense(16, activation="relu6", use_bias=False, name="wide")(_e_bn)
         _e_d    = tf.keras.layers.Dense(128, activation="relu6", use_bias=False, name="deep1")(_e_bn)
         _e_d    = tf.keras.layers.Dense(64, activation="relu6", use_bias=False, name="deep2")(_e_d)
-        _e_dout = tf.keras.layers.Dense(32, activation="relu6", use_bias=False, name="deep_out")(_e_d)
+        _e_dout = tf.keras.layers.Dense(32, use_bias=False, name="deep_out")(_e_d)
+        _e_dout = tf.keras.layers.Rescaling(scale=DEEP_OUT_PRESCALE, name="deep_out_prescale")(_e_dout)
+        _e_dout = tf.keras.layers.Activation("relu6", name="deep_out_relu6")(_e_dout)
+        _e_dout = tf.keras.layers.Rescaling(scale=DEEP_OUT_RESCALE, name="deep_out_rescale")(_e_dout)
         _e_mg   = tf.keras.layers.Concatenate(name="merged")([_e_wide, _e_dout])
         _e_o1 = tf.keras.layers.Dense(1, use_bias=False, dtype="float32", name="diff_1hr")(_e_mg)
         _e_o2 = tf.keras.layers.Dense(1, use_bias=False, dtype="float32", name="diff_2hr")(_e_mg)
@@ -1147,6 +1591,55 @@ def main():
         export_model.compile(optimizer="sgd", loss="mse")
         tf.keras.mixed_precision.set_global_policy(_orig_policy)
         print("   ✅ fp32 export model ready")
+    elif QAT_FINE_TUNE and SKIP_TRAINING:
+        # qat_model is a full clone (tfmot's quantize_model clones via keras.models.clone_model)
+        # — fine-tuning it does NOT update model's weights in place. Using `model` here would
+        # silently re-export pre-QAT Run 18 weights under this run's name. Extract the actual
+        # QAT fine-tuned kernels from each QuantizeWrapperV2's wrapped inner layer instead.
+        # Note: inner_layer.get_weights() does not reflect the live variable after wrapping
+        # (verified directly). inner_layer.kernel also fails after a real fit() call — it
+        # becomes a stale SymbolicTensor left over from QuantizeWrapperV2's fake-quant tracing
+        # (has no .numpy()), reproduced directly against a trained QAT model. The reliable path
+        # is the *wrapper's* own trainable_weights, which still holds the real ResourceVariable
+        # (backing store is unaffected by the inner layer's .kernel attribute being shadowed).
+        # Architecture must be relu, not relu6: QAT fine-tuned model_for_qat's relu graph
+        # (tfmot doesn't support relu6 — see quantize_model call above), so that's what these
+        # weights were actually optimized under.
+        print("\n🔧 Building fp32 export model from QAT fine-tuned weights "
+              "(stripping QuantizeWrapper, relu architecture)...")
+        _qat_kernels = {}
+        for _l in qat_model.layers:
+            _inner = getattr(_l, "layer", None)
+            if _inner is not None and hasattr(_inner, "kernel"):
+                _kernel_var = next(
+                    w for w in _l.trainable_weights
+                    if w.name.startswith(f"{_inner.name}/kernel"))
+                _qat_kernels[_inner.name] = _kernel_var.numpy()
+        _e_inp  = tf.keras.layers.Input(shape=(SEQ_LEN, n_features), name="input")
+        _e_pool = tf.keras.layers.AveragePooling1D(pool_size=6, strides=6, name="avgpool")(_e_inp)
+        _e_flat = tf.keras.layers.Reshape((SEQ_LEN // 6 * n_features,), name="flatten")(_e_pool)
+        _e_bn   = tf.keras.layers.Dense(64, activation="relu", use_bias=False, name="bottleneck")(_e_flat)
+        _e_wide = tf.keras.layers.Dense(16, activation="relu", use_bias=False, name="wide")(_e_bn)
+        _e_d    = tf.keras.layers.Dense(128, activation="relu", use_bias=False, name="deep1")(_e_bn)
+        _e_d    = tf.keras.layers.Dense(64, activation="relu", use_bias=False, name="deep2")(_e_d)
+        _e_dout = tf.keras.layers.Dense(32, use_bias=False, name="deep_out")(_e_d)
+        _e_dout = tf.keras.layers.Rescaling(scale=DEEP_OUT_PRESCALE, name="deep_out_prescale")(_e_dout)
+        _e_dout = tf.keras.layers.Activation("relu6", name="deep_out_relu6")(_e_dout)
+        _e_dout = tf.keras.layers.Rescaling(scale=DEEP_OUT_RESCALE, name="deep_out_rescale")(_e_dout)
+        _e_mg   = tf.keras.layers.Concatenate(name="merged")([_e_wide, _e_dout])
+        _e_o1 = tf.keras.layers.Dense(1, use_bias=False, dtype="float32", name="diff_1hr")(_e_mg)
+        _e_o2 = tf.keras.layers.Dense(1, use_bias=False, dtype="float32", name="diff_2hr")(_e_mg)
+        _e_o3 = tf.keras.layers.Dense(1, use_bias=False, dtype="float32", name="diff_3hr")(_e_mg)
+        export_model = tf.keras.Model(inputs=_e_inp, outputs=[_e_o1, _e_o2, _e_o3])
+        for _l in export_model.layers:
+            if _l.name in _qat_kernels:
+                _l.set_weights([_qat_kernels[_l.name]])
+            elif hasattr(_l, "kernel"):
+                raise RuntimeError(
+                    f"QAT export: no fine-tuned kernel found for layer '{_l.name}' — "
+                    f"QuantizeWrapper layer-name extraction did not cover the full model.")
+        export_model.compile(optimizer="sgd", loss="mse")
+        print(f"   ✅ fp32 export model ready ({len(_qat_kernels)} kernels transferred from QAT)")
     else:
         export_model = model
 
@@ -1156,11 +1649,16 @@ def main():
     print("\n🔍 FP32 export model sanity check...")
     _sanity = export_model.evaluate(val_ds.take(5), verbose=0)
     _sanity_loss = float(_sanity[0])
-    if _sanity_loss >= 0.001:
+    # QAT export_model's loss reflects legitimate fine-tuned weights, which (per the post-QAT
+    # weight-verification check above) may genuinely regress up to ~0.002 — not a copy bug.
+    # Non-QAT threshold stays tight at 0.001 since that path is purely a dtype-cast copy and
+    # any deviation from the source model's already-verified loss indicates a real bug.
+    _sanity_threshold = 0.002 if (QAT_FINE_TUNE and SKIP_TRAINING) else 0.001
+    if _sanity_loss >= _sanity_threshold:
         raise RuntimeError(
             f"FP32 export model sanity check FAILED: val_loss={_sanity_loss:.6f} "
-            f"(expected < 0.001). Weight copy from mixed-precision model produced invalid results. "
-            f"Aborting before INT8 export.")
+            f"(expected < {_sanity_threshold}). Weight transfer to the export model produced "
+            f"invalid results. Aborting before INT8 export.")
     print(f"   ✅ FP32 export sanity check passed: val_loss={_sanity_loss:.6f}")
 
     run_model = tf.function(export_model)
@@ -1185,19 +1683,23 @@ def main():
         print(f"   ⚠️  FP32 export failed: {e}")
 
     # INT8 export (full-integer quantization for Coral Edge TPU)
+    # QAT path: TFLiteConverter.from_keras_model(qat_model) uses the fake-quant scales
+    # embedded in the QAT model's QuantizeWrapper layers for internal op quantization.
+    # representative_dataset is still provided for input/output tensor quantization.
+    # PTQ path: from_concrete_functions with representative_dataset as before.
     print("🔧 Exporting INT8 TFLite model (Coral Edge TPU)...")
     try:
         def representative_data_gen():
-            # Run 12: use validation data so calibration distribution matches evaluation distribution.
-            # Prior runs used X_train_flat; if train/val cover different seasons the activation scales
-            # computed at calibration time may not match those seen during INT8 accuracy measurement.
             n = X_val_flat.shape[0] - SEQ_LEN + 1
             idxs = np.random.choice(n, size=min(2000, n), replace=False)
             for idx in idxs:
                 window = X_val_flat[idx:idx + SEQ_LEN][np.newaxis, :]  # (1, SEQ_LEN, n_features)
                 yield [window.astype(np.float32)]
 
-        converter_int8 = tf.lite.TFLiteConverter.from_concrete_functions([concrete_func])
+        if QAT_FINE_TUNE and SKIP_TRAINING:
+            converter_int8 = tf.lite.TFLiteConverter.from_keras_model(qat_model)
+        else:
+            converter_int8 = tf.lite.TFLiteConverter.from_concrete_functions([concrete_func])
         converter_int8.optimizations = [tf.lite.Optimize.DEFAULT]
         converter_int8.representative_dataset = representative_data_gen
         converter_int8.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
@@ -1207,7 +1709,8 @@ def main():
         with open(tflite_int8_path, "wb") as f:
             f.write(int8_model)
         tflite_int8_kb = os.path.getsize(tflite_int8_path) / 1024
-        print(f"   ✅ INT8 TFLite: {tflite_int8_kb:.1f} KB → {tflite_int8_path}")
+        _int8_label = "QAT INT8" if (QAT_FINE_TUNE and SKIP_TRAINING) else "INT8"
+        print(f"   ✅ {_int8_label} TFLite: {tflite_int8_kb:.1f} KB → {tflite_int8_path}")
     except Exception as e:
         print(f"   ⚠️  INT8 export failed: {e}")
 
@@ -1258,12 +1761,12 @@ def main():
         "tflite_fp32_kb": tflite_fp32_kb,
         "tflite_int8_kb": tflite_int8_kb,
         "n_features": n_features,
-        "architecture": "avgpool6→flat330+bottleneck(64,fused_relu6)+wide(16,fused_relu6)+deep(128→fused_relu6→64→fused_relu6→32→fused_relu6)→merge(48);11feat:no_bn,no_residual;fused_activation_run14",
+        "architecture": f"avgpool6→flat390+bottleneck(64,relu6)+wide(16,relu6)+deep(128→relu6→64→relu6→32→linear)→deep_out_prescale(x{DEEP_OUT_PRESCALE:.4f})→relu6→deep_out_rescale(x{DEEP_OUT_RESCALE:.4f})→merge(48);13feat:no_bn,no_residual;run22_warmstart_from_run20",
         "l2_reg": L2_REG,
         "feature_importance_permutation": sorted_importance,
         "features": features,
         "hyperparams": {
-            "architecture": "avgpool6_two_path_bottleneck_fused_relu6_no_bn_no_residual_run14",
+            "architecture": "avgpool6_two_path_bottleneck_relu6_no_bn_no_residual_deep_out_prescale_relu6_rescale_run22_from_run20",
             "seq_len": SEQ_LEN,
             "l2_reg": L2_REG,
             "initial_lr": INITIAL_LR,
