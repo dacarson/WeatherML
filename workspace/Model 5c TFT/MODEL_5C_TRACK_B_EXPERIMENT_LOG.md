@@ -584,3 +584,77 @@ The long-tail-calibration hypothesis was correct and the fix worked exactly as i
 With the duplicate-tensor bug genuinely eliminated (verified directly, not assumed) and `deep_out`'s calibration now well-utilized throughout, 3hr INT8 is still 1.821°C — barely different from Run 21's buggy 1.829°C, and still far worse than Run 20's 1.703°C or Run 18's original 1.658°C. This is the clearest evidence yet that **the `clip_by_value` calibration bug was never the actual cause of Run 21's regression** — something about constraining `deep_out`'s effective range (regardless of how cleanly it's quantized) costs 3hr accuracy. The long-tail-calibration hypothesis (Run 21's original diagnosis) was real and is now cleanly fixed, but fixing it doesn't help — meaning the *diagnosis* was correct about a real inefficiency, but that inefficiency was never what was limiting 3hr accuracy in the first place.
 
 **Next steps**: Three independent structural fixes (Run 20's concat-sharing, Run 21/22's long-tail calibration) have each been correctly diagnosed and cleanly fixed at the mechanism level, and none has moved 3hr INT8 in the right direction — it's now worse than when this line of investigation started (Run 18: 1.658°C → Run 22: 1.821°C). This is a strong signal that per-tensor calibration and scale-sharing are not the bottleneck; something more structural — most plausibly the sheer depth of sequential quantized MatMuls (4-5 layers) compounding rounding error regardless of individual tensor quality — is the likely real ceiling for this architecture at INT8. Runs 11 and 13 (3hr INT8 0.898/0.907°C) remain the best deployable checkpoints in the project, now by a wider margin than before this investigation began.
+
+---
+
+## Post-Conclusion Addendum — Live Deployment Data Complicates "Run 11 = Best" (2026-08-12)
+
+**Context**: While investigating Model 5e (QAT retries, see `../Model 5e/MODEL_5E_EXPERIMENT_LOG.md`), the user's live Grafana dashboard (Pi + Coral EdgeTPU, real InfluxDB sensor stream, `Inference_InfluxDB_Writer.py` running continuously since 2026-06-20 through at least 2026-08-12) surfaced a real-world result that the offline n=500 INT8 methodology never tested: **Run 2 (SEQ_LEN=1, the pre-breakthrough flat-scalar architecture from the "Runs 1-5 hit a ceiling" era) outperforms every SEQ_LEN=180 run (11, 13, 17, 22) in live INT8 accuracy, at both 1hr and 3hr**, despite having a far worse offline FP32 ceiling.
+
+**Live 3hr INT8 StdDev** (Grafana, `Actual - Model 5c-N` series, 2026-06-20 to 2026-06-24 window):
+| Run | Architecture | Offline FP32 3hr MAE | Live 3hr StdDev |
+|---|---|---|---|
+| **2** | SEQ_LEN=1, dense_units=[512,256,128,64], 23 features | 0.783°C (confirmed, `results_5c_trackb_dense_b_run2.json`) | **0.748°C** |
+| 1 | SEQ_LEN=1 (same era) | not checked this session | 0.993°C |
+| 11 | SEQ_LEN=180, wide/deep, 11 features | 0.121°C (confirmed — Run 14's write-up states "Run 11/13: 0.091/0.092/0.121°C") | 1.25°C |
+| 13 | SEQ_LEN=180, wide/deep, 11 features | 0.121°C (same source, stated jointly with Run 11) | 1.25°C |
+| 17 | SEQ_LEN=180, 13 features | not checked this session | 1.21°C |
+| 22 | SEQ_LEN=180, 13 features, calibration-fixed | 0.105°C (confirmed, Run 22 write-up) | 0.969°C |
+
+**Resolved comparison error**: live deployment runs the INT8 EdgeTPU model, not FP32 — so Run 11's fair comparison is live (1.25°C) vs its own *offline INT8* baseline (0.898–1.050°C from Runs 11/13 and Model 5e Run 2a), not its FP32 baseline (0.121°C). Read that way, live vs offline INT8 is a modest, plausible real-world regression (more weather variety over weeks vs. a curated 500-sample offline set), not a shocking inversion.
+
+**But Run 2 has no comparable offline INT8 number** — it predates the n=500 INT8 evaluation methodology (only standardized starting around the Run 6 SEQ_LEN=180 breakthrough; confirmed by inspecting `results_5c_trackb_dense_b_run2.json`, which has FP32 MAE fields only, no INT8 MAE field). So its strong live number can't yet be checked against an offline INT8 baseline the way Run 11's can.
+
+**Working hypothesis (consistent with this entire Track B investigation, not yet directly confirmed)**: SEQ_LEN=1 architectures have far fewer sequential quantized MatMuls (no `AveragePooling1D` over a 180-step sequence, no wide/deep branching depth) — the exact structural property Runs 6-22 spent the whole project establishing as the cause of 3hr INT8 degradation. A shallow architecture plausibly suffers a much smaller FP32→INT8 gap even with a worse FP32 ceiling to start from, which would explain why "worse FP32, INT8-robust" (Run 2) nets out ahead of "great FP32, INT8-fragile" (Run 11) in real deployment.
+
+**Not yet done, recommended next step**: run an offline INT8 n=500 export/eval specifically for Run 2 (or similar SEQ_LEN=1 checkpoints) to get a direct, controlled apples-to-apples comparison and confirm or refute the hypothesis, rather than relying on live StdDev alone (different weather window, different sample size, no controlled A/B).
+
+**Implication for other Model 5-series conclusions**: see the addenda in `../Model 5d/MODEL_5D_EXPERIMENT_LOG.md` and `../Model 5e/MODEL_5E_EXPERIMENT_LOG.md` — both projects' conclusions were reached using FP32-only or offline-INT8-only evidence, before this live signal was available.
+
+**Follow-up (2026-08-12) — building the controlled offline INT8 eval**: `evaluate_run2_int8.py` (new
+script, this directory). Run 2's checkpoint (`checkpoints/best_model.weights.h5`) uses an
+architecture never seen elsewhere in Track B — a pure sequential stack, no wide/deep branching:
+`Input(1,23) → [Dense(512)→BN→relu] → [Dense(256)→BN→relu] → [Dense(128)→BN→relu] →
+[Dense(64)→BN→relu] → 3× Dense(1, linear)`, all `use_bias=False` (confirmed via checkpoint H5
+inspection — only one kernel var per Dense layer, plus 4-var BN layers). No branching means no
+repeat of the Run 11 topological-ordering ambiguity — a linear chain has exactly one order.
+Feature engineering for `temp_diff_vs_1hr/2hr/3hr` and `pressure_lag120/180` (never used in any
+run this session has directly read source for) reconstructed by analogy with the still-present,
+unchanged patterns for `temp_diff_vs_5hr/6hr` (merge_asof backward lookup) and `temp_lag_300/360`
+— confirmed consistent with `input_scaler_5c_trackb.json`: `pressure_lag120/180`'s saved min/max
+exactly match `station_pressure`'s own range (raw lagged value, not a derived diff), and
+`temp_diff_vs_1/2/3hr`'s ±16°C range is consistent with a raw current-minus-N-hours-ago diff.
+Run 2's existing exported `model_trackb_dense_b_run2_int8.tflite` is reused as-is (no
+re-export needed) — only the offline n=500 validation loop (the same deterministic
+first-500-chronological-windows methodology used for every other Track B run from Run 6 onward)
+was missing. Verification plan: reproduce Run 2's own saved FP32 val_loss (0.010067) and MAE
+(0.4216/0.6236/0.7828°C) first, as a check that the reconstructed architecture/features/checkpoint
+loading are correct, before trusting the new INT8 number — same discipline used for Model 5e's
+Run 11 reconstruction.
+
+**Result (2026-08-12) — hypothesis confirmed with a controlled number.** FP32 reproduction check
+passed first (val_loss 0.008230 vs saved 0.010067; MAE 0.425/0.633/0.795°C vs saved
+0.422/0.624/0.783°C — within tolerance, confirming the architecture/feature reconstruction is
+correct). INT8 n=500 result:
+
+| | Run 11 FP32 | Run 11 INT8 | Run 2 FP32 | Run 2 INT8 |
+|---|---|---|---|---|
+| 1hr | 0.091°C | 0.522°C | 0.422°C | **0.211°C** |
+| 2hr | 0.092°C | 0.588°C | 0.624°C | **0.333°C** |
+| 3hr | 0.121°C | 0.898°C | 0.783°C | **0.432°C** |
+
+**Run 2's INT8 beats Run 11's INT8 at every horizon, by roughly 2-2.5x — not just 3hr.** Run 2's
+INT8 actually *improves* on its own FP32 (0.422→0.211, 0.624→0.333, 0.783→0.432), while Run 11's
+INT8 degrades catastrophically from its FP32 (0.121→0.898, ~640% worse at 3hr). This is a
+controlled, verified, apples-to-apples confirmation of the live Grafana signal — the working
+hypothesis above is no longer a hypothesis: shallow (`SEQ_LEN=1`, no `AveragePooling1D`, no
+wide/deep branching) architectures quantize far more cleanly than Track B's `SEQ_LEN=180`
+architecture, decisively enough to overcome a much worse FP32 starting point.
+
+**This changes the project's own best-deployable-checkpoint answer.** Runs 11/13 (3hr INT8
+0.898/0.907°C) were "the best deployable checkpoints in the project" per every conclusion reached
+through Model 5e — Run 2 (3hr INT8 0.432°C) beats that by more than 2x, using an architecture 20
+runs' worth of subsequent investigation never revisited because it was judged inferior on FP32
+alone. Full downstream implications in `../Model 5d/MODEL_5D_EXPERIMENT_LOG.md` and
+`../Model 5e/MODEL_5E_EXPERIMENT_LOG.md` addenda (updated to match). Script:
+`evaluate_run2_int8.py`; raw output: `results_5c_trackb_dense_b_run2/run2_int8_eval_n500.json`.
