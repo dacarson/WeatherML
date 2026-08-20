@@ -2,7 +2,7 @@
 
 A machine learning project that uses historical weather data from a **Tempest Weather Station** to predict future temperatures, quantizes the models to INT8 TFLite, compiles them for the **Coral Edge TPU**, and deploys inference on a **Raspberry Pi**.
 
-This README is a tutorial tracing the journey from a simple dense baseline to a ~15× accuracy improvement over that baseline — and the lessons learned along the way.
+This README is a tutorial tracing the journey from a simple dense baseline to a ~15× offline accuracy improvement (Model 5a) — and then, once live deployment data started disagreeing with offline metrics, to the discovery that offline accuracy and live reliability are different questions, and a return to a simpler, INT8-robust architecture (Model 5f) that actually holds up. The lessons learned along the way are the point as much as the numbers.
 
 ---
 
@@ -345,6 +345,137 @@ Model 6 applies the same wide-deep-interaction architecture to a different predi
 
 ---
 
+### Step 8 — Feature Discovery via Attention: Model 5c Track A (TFT)
+
+**Directory**: `workspace/Model 5c TFT/` (Track A files: `train_model_tft_track_a.py`, `results_5c_run6/`)
+
+Model 5b's 40-experiment Conv2D investigation established that architecture wasn't the bottleneck — feature engineering was. Model 5c asks a different question: can a **Temporal Fusion Transformer (TFT)** discover which (feature, lag) pairs matter automatically, via attention, instead of hand-engineering them? Two tracks split off this idea: **Track A** deploys the TFT directly; **Track B** (Step 9) uses Track A purely as a discovery tool, feeding its findings into a lean, TPU-deployable Dense model.
+
+**Architecture** (SEQ_LEN=180, 24 features, `D_MODEL=128`, `N_HEADS=8`):
+```
+Input (180 timesteps × 24 features)
+  → Variable Selection Network (VSN)     ← learned per-timestep feature weighting
+  → Sinusoidal positional encoding
+  → Multi-head self-attention (8 heads)  ← learns which past positions matter
+  → GRN (post-attention) → GRN (feedforward)
+  → last timestep → Dense(1) × 3         ← diff_1hr, diff_2hr, diff_3hr
+```
+
+The VSN (Lim et al. 2019) computes softmax importance weights per feature per timestep; attention scores reveal which historical positions the model actually relies on.
+
+**Feature discovery findings**: attention heads specialize by horizon — Head 0 anchors on t-60 (1hr), Head 6 on t-120 (2hr), five heads converge on t-168 to t-179 (the 3hr boundary). VSN and permutation importance mostly agree except on raw `temperature`, which ranks last in permutation importance despite high VSN weight — `temp_slope_15/30/60` fully substitute for it. `wind_lull`/`rain_accumulated` confirmed floor-importance across every run. A follow-up "Deep" run (SEQ_LEN=360) tested whether the t-179 attention peak was a real 3-hour signal or a sequence-boundary artifact.
+
+**Results**: val_loss 0.000953, MAE **0.0028°C / 0.0050°C / 0.0075°C** (1/2/3hr) — roughly 10-100× better than any other model in this project, offline. This number is genuine, not a bug: reproduced almost exactly (0.0016/0.0038/0.0079°C) on the full 349K-window validation population via an independently-reconstructed architecture, before any live deployment was trusted.
+
+> **The TFLite export is permanently blocked.** The VSN's 4D `tf.BatchMatMulV2` einsum is incompatible with the TFLite converter — not a bug, a hard architectural wall. Track A can never run on the Coral Edge TPU, or even as INT8 anywhere. It was purpose-built as a feature-discovery tool for Track B, not a deployment candidate.
+
+**Lesson learned — and the most important one in this file**: an offline number this good demands more suspicion, not less. Track A went undeployed for two months because it structurally couldn't reach the TPU — until a from-scratch Keras FP32 inference path was built specifically to test it live (see "The Live-vs-Offline Gap" below). The result: live StdDev **0.510°C / 1.21°C** (1/3hr) — statistically indistinguishable from Track B's mediocre `SEQ_LEN=180` cluster (Step 9), despite a ~10-100× better offline MAE. More modeling power bought a better validation-set number and nothing else.
+
+---
+
+### Step 9 — Optimized TPU Model: Model 5c Track B
+
+**Directory**: `workspace/Model 5c TFT/` (Track B files: `train_model_track_b.py`, `results_5c_trackb_*/`)
+
+Track B takes Track A's discovered (feature, lag) pairs and encodes them explicitly into a lean Dense model, aimed squarely at Coral TPU deployment. 22 runs, in two phases.
+
+**Runs 1-5** (`SEQ_LEN=1`, flat scalar features): hit a hard ceiling around 0.42-0.94°C 1hr MAE regardless of feature engineering or architecture — the single-timestep approach had an information ceiling no amount of tuning could cross.
+
+**Run 6** (`SEQ_LEN=180 + AveragePooling1D`): breakthrough. Restoring direct access to the 3-hour window produced a 10-16× FP32 improvement (val_loss 0.000537, MAE **0.041°C / 0.044°C / 0.073°C**) — but INT8 quantization was catastrophic (+810% to +1550% degradation, MAE 0.373/0.726/0.933°C). The wide/deep architecture with an element-wise interaction path produced activation dynamic ranges hostile to 8-bit quantization.
+
+**Runs 7-22**: sixteen further runs, each testing a specific, confirmed INT8-degradation mechanism — removing the interaction path, `relu6` throughout, removing BatchNorm, removing the residual `Add`, calibration-data fixes, concat forced-shared-scale rebalancing, long-tail activation calibration. Each fix was real and verified, and none recovered 3hr INT8 accuracy. Best FP32 settled at Run 21/22 (val_loss 0.000398-0.000400, MAE **0.068°C / 0.080°C / 0.105°C**); best deployable INT8 was Run 11 (3hr MAE 0.898°C, beating Model 5b's live bar).
+
+**Concluded 2026-07-22**: the INT8 bottleneck is structural — 4-5 sequential quantized MatMuls plus branching/concat, not any single fixable tensor or weight distribution. Succeeded by Model 5d, which drops the raw sequence entirely to eliminate the problem by construction.
+
+**Post-conclusion reversal**: live Grafana data later showed **Run 2** (a pre-breakthrough `SEQ_LEN=1` checkpoint, FP32 3hr MAE a mediocre 0.783°C) beating Run 11 in live INT8 accuracy — 0.748°C live StdDev vs. Run 11's 1.25°C. A controlled offline re-test confirmed it wasn't noise: Run 2's INT8 MAE (0.211/0.333/0.432°C) beats Run 11's (0.522/0.588/0.898°C) by 2-2.5× at every horizon. Shallow `SEQ_LEN=1` architectures, it turns out, suffer far less FP32→INT8 degradation than `SEQ_LEN=180` ones — the same structural property (fewer sequential quantized MatMuls) the whole Run 7-22 investigation had already identified as the INT8 bottleneck. This became the new best-known checkpoint and the direct motivation for Model 5f.
+
+**Lesson learned**: architectural depth that helps FP32 accuracy (a longer raw sequence, more MatMul layers, branching) is close to a straight liability for INT8 deployment. The two objectives pull in opposite directions, and no amount of calibration-mechanism fixing closes that gap once the sequential-MatMul depth is baked in.
+
+---
+
+### Step 10 — Is the Raw Sequence Necessary? Model 5d
+
+**Directory**: `workspace/Model 5d/`
+
+Track A/B's own attribution methods (VSN, Integrated Gradients, permutation importance) found that `temp_slope_15/30/60` and `temp_diff_vs_5hr/6hr` — both precomputed scalars, not raw-sequence-dependent — carried most of the useful temperature signal. Model 5d tests the natural hypothesis this suggests: if the signal is already distilled into scalar features, drop the raw 180-step sequence entirely and eliminate Track B's structural INT8 problem by construction.
+
+**Five runs, each closing one hypothesis**:
+| Run | Change tested | val_loss | FP32 MAE 1/2/3hr |
+|---|---|---|---|
+| 1 | Baseline flat `Dense(64)→Dense(32)` | 0.009168 | 0.434/0.638/0.804°C |
+| 2 | Width doubled | 0.009107 | 0.434/0.639/0.799°C |
+| 3 | Depth added (3 layers) | 0.009077 (best) | 0.429/0.634/0.790°C |
+| 4 | Topology: Track B's wide/deep/concat | 0.009221 | 0.426/0.634/0.798°C |
+| — | *Diagnostic*: label/loss-framing check | — | — |
+| 5 | Diurnal-shortcut ablation (drop 4 time-of-day features) | 0.013401 (worst) | 0.460/0.747/1.005°C |
+
+Width, depth, and topology all landed within noise of each other — none was the bottleneck. A pre-Run-5 diagnostic (no training) confirmed the scaling/loss formula was byte-identical to Model 5a's proven-working scheme, and that the model beat a trivial persistence baseline by 24-40% — not a labels bug either. Run 5 tested whether `time_of_day_cos` was a shortcut suppressing the slope/diff features: removing it made accuracy *worse*, and the model backfilled onto solar/humidity features instead of ever routing through `temp_slope_*`/`temp_diff_vs_*hr` — the shortcut hypothesis was wrong too.
+
+**Concluded 2026-08-11**: every candidate the project's own decision tree proposed was exhausted. The founding premise — that Track A/B's discovered scalar features are sufficient without raw-sequence access — does not hold at Model 5a/Track B's accuracy level. No checkpoint deployed.
+
+**Lesson learned**: a feature mattering to an attention model's attribution doesn't mean it carries that same signal in isolation. `temp_slope_*`/`temp_diff_vs_*hr`'s importance in Track A/B was very likely contingent on sequence *context* — position relative to other timesteps, interaction with the attention pattern — that a flat scalar snapshot can't reproduce.
+
+---
+
+### Step 11 — Does Quantization-Aware Training Rescue Track B? Model 5e
+
+**Directory**: `workspace/Model 5e/`
+
+A narrow, targeted follow-up: Track B's original QAT plan was retargeted mid-flight to a different checkpoint and never actually tested against Run 11 (the best deployable checkpoint) or Run 22 (the fully calibration-fixed architecture). Model 5e closes those two specific gaps.
+
+**Run 1** (QAT from Run 22): INT8 MAE 0.635/1.090/1.627°C — misses Run 11's 0.898°C 3hr target by ~81%, and FP32 itself regressed ~60-70% from Run 22's PTQ baseline.
+
+**Run 2** (QAT from Run 11): required reconstructing Run 11's exact checkpoint-compatible architecture from the `.weights.h5` file directly via `h5py` — Keras 3's weights format has no `by_name` loading path, and Run 11 turned out not to be uniformly unfused as its own plan document assumed. Verified via a save-weights round-trip before trusting it. Result: 3hr INT8 1.121°C vs. its own PTQ baseline of 1.050°C — a 6.8% miss, same failure shape as Run 1.
+
+**Concluded 2026-08-12**: five independent angles now agree — calibration-mechanism fixes (Track B Runs 20-22), QAT on the unfixed graph (Track B Run 19), and QAT on both the calibration-fixed and simplest pre-fix graphs (this project) all fail to beat Track B's existing PTQ checkpoints. QAT tunes weights; the bottleneck is graph depth, which QAT can't address.
+
+**Post-conclusion retraction**: the recommended fallback ("deploy Run 11") was wrong, for the same reason established in Step 9 — Track B Run 2 beats Run 11 live and offline by 2-2.5×. Do not deploy Run 11.
+
+**Lesson learned**: when a hypothesis has already been disproven along one axis (calibration), retesting it along an adjacent axis (QAT) on the same underlying architecture is worth doing precisely once, with a clear pre-registered pass/fail bar — not as an open-ended fishing expedition.
+
+---
+
+### Step 12 — The Winning Formula: Model 5f
+
+**Directory**: `workspace/Model 5f/`
+
+Track B Run 2's live-beats-Run-11 result (Step 9) pointed at something specific: shallow, `SEQ_LEN=1` architectures survive INT8 quantization far better than deep, windowed ones — but Run 2 itself predates all of Track A/B's feature-curation work. Model 5f combines Run 2's proven-good shallow shape with the curated feature set, isolating one design variable per run.
+
+**Runs 1-3** (feature-set variations): all worse than Run 2's own 23-feature baseline (0.432°C 3hr INT8) — `temp_diff_vs_5hr/6hr`, the single most important feature in Model 5d's architecture, proved actively harmful here in every combination tested (substitution, addition, isolated swap). Real architecture-dependence, not a fluke.
+
+**Runs 4-8** (architecture variables, holding Run 2's 23 features fixed):
+| Run | Change | INT8 3hr MAE | vs. previous best |
+|---|---|---|---|
+| 4 | Remove BatchNorm | **0.396°C** | −8.3% |
+| 5 | `relu` → `relu6` | **0.308°C** | −22% further |
+| 6 | Narrow 512→256→128→64 to 128→64→32 | 0.360°C | *worse* — narrowing hurts here |
+| 7 | Tighten solar-feature INT8 bounds + diff features | mixed | surfaced a calibration bug (below) |
+| 8 | Isolated bound-tightening, no diff features | **0.219°C / 0.277°C / 0.303°C** | new best (post calibration fix) |
+
+BatchNorm-removal and `relu6` are separate, additive INT8-robustness mechanisms (different sources of unbounded activation range — BN's unconstrained γ vs. plain `relu`'s unbounded ceiling), confirming the same direction Track B's deep architecture had found, at smaller magnitude. Narrowing hurt — the opposite of what Model 5d's narrow, competitive result might have suggested; architecture-dependence again.
+
+**A real calibration bug, found and fixed**: Run 7/8's initial numbers showed a severe, isolated 1hr outlier (2.022°C). Root cause: every prior 5d/5c/5f training script's `representative_data_gen()` was unseeded and unstratified, and an unlucky random calibration sample missed the model's own positive `diff_1hr` predictions almost entirely, hard-clipping real inference output. `requantize_int8.py` fixes this by stratifying the calibration set on the model's **own FP32 predictions** (not true labels — that made things worse) and force-including each output head's most extreme predictions. This is now the standard re-quantization path for any future comparison in this project.
+
+**Live-deployment validation** (three independent 30-day Grafana windows, averaged): Run 8 is best-or-tied-best at both horizons (3hr StdDev ≈0.893°C, 1hr ≈0.530°C) — the single-week-window caveat from earlier in this project (see Key Learnings) resolved cleanly once measured properly. Track B Run 2, the checkpoint this whole project benchmarked against, is decisively worst-of-group at 3hr in all three windows.
+
+**The capstone comparison (2026-08-20)**: Run 8's FP32 export (`model_5f_5f_run8_fp32.tflite`, already existed from the standard training pipeline) was live-deployed alongside its INT8 twin for a direct, same-checkpoint comparison — the only fair one in this whole investigation, since Track A and Track B Run 6's "better" FP32 numbers turned out to come from different, live-unreliable architectures. Result: StdDev 0.265°C/0.541°C (FP32) vs. 0.264°C/0.537°C (INT8) — statistically indistinguishable. For an architecture actually designed for bounded, smooth activations, INT8 quantization costs almost nothing.
+
+**Status**: **Run 8 (INT8) is the best-validated model in the entire Model 5-series** — best-or-tied across three independent 30-day windows, holds up in the specific volatile window that broke every deep/sequence architecture tested (Track A included), and shows no meaningful FP32 penalty. Recommended for deployment.
+
+---
+
+### The Live-vs-Offline Gap
+
+This deserves its own section because it reframes how to read every result above. Offline MAE/val_loss is an **average over an entire validation set** — a year of mostly calm weather with occasional volatile stretches. A live Grafana window is a **specific few days**. These only diverge badly when a model's low average error comes from a mechanism that's fragile on the minority of hard days.
+
+**Confirmed directly, not just observed**: restricting a full-population offline evaluation to the exact dates of a bad live window reproduced the live numbers almost exactly, for both Track B Run 6 and Track A's TFT. The offline pipeline wasn't buggy — it was answering "how good is this model across a whole year," a different question than "how good is this model this week."
+
+**Why some architectures have this problem and others don't**: Track A (full attention over 180 raw steps) and Track B Run 6-22 (Dense over a pooled 180-step sequence) both have enough capacity and fine-grained recent history to learn a sharp, confident "extrapolate the recent trend" strategy — excellent on calm days (most days, hence great aggregate MAE), badly wrong during regime transitions. Model 5f's flat, feature-engineered architecture has no raw sequence to extrapolate from at all, so it structurally can't build that shortcut — duller predictions on calm days, but no tail blowup on hard ones.
+
+**This is architecture-dependent, not universal**: Model 5f Run 8's offline INT8 number (0.219-0.303°C) and live number (0.264-0.539°C) stayed within 20-70% of each other, not 10-15×. Offline evaluation is trustworthy for catching bugs, comparing models *within* the same architecture family, and fast iteration — it is not trustworthy for comparing *across* architecture families with different capacity for sequence-extrapolation shortcuts, or for anything about worst-case/tail behavior. Any future architecture with raw or pooled sequence access should be treated as live-validation-required regardless of how good its offline number looks — the better that number, the more suspicious it deserves to be.
+
+---
+
 ## Performance Summary
 
 | Model | Architecture | Predicts | val_loss | val_mae | Size |
@@ -361,9 +492,22 @@ Model 6 applies the same wide-deep-interaction architecture to a different predi
 | Model 5b Conv2D (Exp 32 best) | Conv2D + anchor skip | Temp diff +1/2/3hr | 0.0024 | — | ~193 KB ✅ Edge TPU |
 | Model 6 | Wide-deep + interaction | Solar diff +30/60/90min | 0.0185 | 0.025 | 48 KB |
 
-> All metrics are normalised (targets scaled to approximately `[−1, 1]`).  
-> Model 5a clean avgpool is the current production deployment (Edge TPU, 0.000508 val_loss).  
-> Model 5a clean no-pool achieves the best absolute accuracy (0.000373) but requires CPU TFLite.
+> All metrics above are normalised (targets scaled to approximately `[−1, 1]`).
+
+Model 5c onward each use their own target scaler range, so `val_loss` is not comparable across rows the way it is above — the table below uses °C MAE instead, which is directly comparable, plus **live** StdDev where measured (the metric that actually matters — see "The Live-vs-Offline Gap"):
+
+| Model | Architecture | Offline FP32 MAE 1/2/3hr | Offline INT8 MAE 1/2/3hr | Live StdDev 1hr/3hr |
+|-------|-------------|---------------------------|---------------------------|----------------------|
+| 5c Track A (TFT) | Full self-attention, SEQ_LEN=180 | 0.0028/0.0050/0.0075°C | never exportable | 0.510°C / 1.21°C |
+| 5c Track B Run 6 | Dense + AvgPool, SEQ_LEN=180 | 0.041/0.044/0.073°C | 0.373/0.726/0.933°C | 0.513°C / 1.21°C |
+| 5c Track B Run 11 | Dense + AvgPool, SEQ_LEN=180 (best FP32-era pick) | 0.091/0.092/0.121°C | 0.522/0.588/0.898°C | 0.581°C / 1.24°C |
+| 5c Track B Run 2 | Dense, SEQ_LEN=1 (pre-breakthrough) | 0.422/0.624/0.783°C | 0.211/0.333/0.432°C | — / 0.748°C |
+| 5d (concluded, undeployed) | Flat Dense, no raw sequence | 0.429/0.634/0.790°C (Run 3, best) | — | — |
+| 5e (concluded, undeployed) | QAT retry on Track B Run 11/22 | — | did not beat PTQ baseline | — |
+| **5f Run 8 (INT8)** | **Shallow Dense, BN-free, relu6, tightened calibration** | 0.421/0.634/0.797°C | **0.219/0.277/0.303°C** | **0.264°C / 0.537°C** |
+| 5f Run 8 (FP32) | same checkpoint, unquantized | 0.421/0.634/0.797°C | n/a | 0.265°C / 0.541°C |
+
+> **Model 5f Run 8 (INT8) is the current recommended deployment** — best-or-tied-best across three independent 30-day live windows, and the only architecture in this family that doesn't fall apart in the specific volatile window that broke Track A and every Track B `SEQ_LEN=180` checkpoint. Model 5a clean (avgpool, 0.000508 val_loss, Edge TPU) was the production model prior to this investigation; Model 5a clean no-pool (0.000373) has the best absolute *offline* accuracy of the Model 1-6 generation but was never live-validated against the same rigor applied to Model 5c onward.
 
 ---
 
@@ -388,6 +532,14 @@ Model 6 applies the same wide-deep-interaction architecture to a different predi
 9. **Pre-normalise before the inference loop.** In `Inference_InfluxDB_Writer.py`, normalise the entire feature matrix once (vectorised NumPy) before the loop. Per-window normalisation inside the loop saturates CPU at ~3,240 Python ops per prediction — even though the TPU finishes inference in ~0.55 ms.
 
 10. **Climate generalisation fails hard at distribution boundaries.** A model trained on San Francisco data clips predictions at the upper end of the SF training distribution when asked to forecast Palm Springs temperatures (~45°C). This is an out-of-distribution failure, not a capacity failure. Separate models with separate scalers per climate are the simplest fix.
+
+11. **Offline accuracy and live reliability are different questions, and the gap is architecture-dependent.** Offline MAE is a full-year average; a live Grafana window is a few days. Architectures with raw or pooled sequence access (Model 5c Track A's TFT, Track B's `SEQ_LEN=180` family) can learn a sharp "extrapolate the recent trend" strategy that's excellent on calm days and badly wrong during regime transitions — a heavy-tailed error distribution the aggregate metric hides. Confirmed directly: restricting a full-population offline evaluation to a bad live window's exact dates reproduced the live numbers almost exactly, for both Track A and Track B. Flat, feature-engineered architectures (Model 5f) can't build that shortcut and show a much smaller, more trustworthy offline-to-live gap. The better a sequence-hungry architecture's offline number looks, the more suspicious it deserves to be, not less — see "The Live-vs-Offline Gap" above.
+
+12. **INT8 quantization can be a net win, not just a tolerable cost — when the architecture is designed for it.** Model 5f Run 8's FP32 and INT8 exports are statistically indistinguishable live (StdDev 0.265°C vs 0.264°C at 1hr). Removing BatchNorm and switching `relu`→`relu6` each independently improved INT8 accuracy by double digits with no FP32 cost, because they bound activation ranges the same way regardless of numeric precision. Depth and branching that help FP32 accuracy (Track B's wide/deep/concat, more sequential MatMuls) actively hurt INT8 — the two objectives can point in opposite directions, and no amount of post-hoc calibration fixing closes that gap once the depth is baked in.
+
+13. **A held-out validation set doesn't protect against small-sample or single-window evaluation mistakes.** 500-2000 evenly-spaced offline samples are unreliable for heavy-tailed weather-error distributions — evaluate the full population. A single 7-30 day live Grafana window is equally unreliable for ranking models — weather-error variance is regime-dependent and rankings visibly flip between adjacent weeks; use 3+ independent 30-day windows and average.
+
+14. **INT8 calibration must be stratified by the model's own predictions, not the true labels.** An unseeded, unstratified `representative_dataset` can miss a model's own extreme outputs by chance, hard-clipping real inference results (Model 5f Run 6/7's severe 1hr outliers, root-caused and fixed in `requantize_int8.py`). Stratifying the calibration set by true labels instead of predictions made results *worse* — calibration range needs to match what the model outputs, not what's correct.
 
 ---
 
@@ -533,6 +685,8 @@ scp workspace/Model\ 5a\ clean/target_scaler_5a.json pi@raspberrypi:~/
 python Inference_InfluxDB_Writer.py
 ```
 
+> The steps above walk through Model 5a clean, the original Edge TPU pipeline. **For the current recommended model** (Model 5f Run 8 — see Step 12 and the Performance Summary), train from `workspace/Model 5f/train_model_5f_run8.py`, then run inference with `workspace/Model 5f/run_with_restart.py --run 5f_run8` (INT8 on Coral TPU) or `--no-tpu --run 5f_run8` (FP32 on CPU, e.g. for a from-scratch comparison). Both auto-detect the model's input shape and feature set from the run's saved scaler JSON files — no code changes needed to switch runs. Model 5c Track A (the TFT) is the one exception in this repo: it can never export to TFLite (see Step 8), so it runs via a separate from-scratch Keras path, `workspace/Model 5c TFT/run_with_restart_track_a.py` — FP32/CPU only, no `--no-tpu` flag needed since there's no TPU path to disable.
+
 ---
 
 ## Additional Notes
@@ -584,8 +738,12 @@ Full detail: `workspace/SolarChargeML/SOLARCHARGE_PLAN.md` (rationale, data sour
     ├── Model 5/                            # Flat feature vector, temp diff targets
     ├── Model 5 new arch. slope calc/       # Sequence-flattened; first 0.000706 result
     ├── Model 5a pi/                        # Pi port of Model 5a (0.000682)
-    ├── Model 5a clean/                     # BEST MODEL — gap fix + Edge TPU pool (0.000373 / 0.000508)
+    ├── Model 5a clean/                     # Gap fix + Edge TPU pool (0.000373 / 0.000508) — prior production model
     ├── Model 5b Conv2D/                    # Conv2D architecture experiments (best 0.0024, Exp 32)
+    ├── Model 5c TFT/                       # Track A (TFT feature discovery) + Track B (TPU-optimized Dense), 22 Track B runs
+    ├── Model 5d/                           # Flat-feature Dense, no raw sequence — concluded, premise didn't hold
+    ├── Model 5e/                           # QAT retry on Track B Run 11/22 — concluded, didn't rescue INT8
+    ├── Model 5f/                           # BEST MODEL — shallow INT8-robust Dense, Run 8 live-validated (0.219/0.277/0.303°C INT8)
     ├── Model 6/                            # Solar radiation prediction
     ├── Forecaster_1/                       # Weather condition classifier (F1 0.523, complete)
     ├── Forecaster_2/                       # Hierarchical redesign (in progress)
