@@ -658,3 +658,420 @@ runs' worth of subsequent investigation never revisited because it was judged in
 alone. Full downstream implications in `../Model 5d/MODEL_5D_EXPERIMENT_LOG.md` and
 `../Model 5e/MODEL_5E_EXPERIMENT_LOG.md` addenda (updated to match). Script:
 `evaluate_run2_int8.py`; raw output: `results_5c_trackb_dense_b_run2/run2_int8_eval_n500.json`.
+
+---
+
+## Follow-up (2026-08-13) — Re-quantizing Run 2 with the Fixed Calibration Methodology
+
+**Why**: Model 5f's investigation (`../Model 5f/MODEL_5F_EXPERIMENT_LOG.md`, "Calibration Fix"
+entry) found that `representative_data_gen()` — an unseeded, unstratified random sample used for
+INT8 calibration — can silently pin an output tensor's INT8 zero-point at the edge of its range,
+hard-clipping real inference outputs and producing a severe, isolated MAE blowup on whichever
+head/run draws an unlucky sample. This was confirmed twice within Model 5f (Run 8's 1hr MAE
+2.022°C, Run 6's 1hr MAE 1.282°C — both traced to this bug and fixed by re-quantizing with a
+prediction-stratified, seeded representative dataset instead). Run 2's 0.211/0.333/0.432°C number
+above came from `model_trackb_dense_b_run2_int8.tflite`, an already-exported artifact whose
+representative dataset is unknown (the original Run 2 training script no longer exists — see the
+reconstruction note above). Since Run 2 is currently the best-known checkpoint being compared
+against Model 5f's best (Run 8), it's worth re-quantizing with the same fixed methodology to rule
+out the same bug before trusting the comparison.
+
+**Approach**: `requantize_trackb_run2.py` (this directory) reuses the verified feature-engineering
+pipeline and prediction-stratified calibration logic from `../Model 5f/requantize_int8.py`
+directly (architecture-agnostic — only needs a `model` and an `X_pool` array), combined with
+`evaluate_run2_int8.py`'s already-verified architecture reconstruction (Dense→BN→relu ×4,
+512→256→128→64, `use_bias=False`) and checkpoint-loading logic. Repeats the same FP32-reproduction
+verification gate before trusting the re-quantized INT8 result.
+
+**Results (2026-08-13, run in-session, CPU inference only — no retraining)**: FP32 reproduction
+check passed first (val_loss 0.008230, MAE 0.425/0.633/0.795°C — matches the earlier verified
+reconstruction above within tolerance). Re-quantized INT8 (n=500, prediction-stratified calibration,
+2,090 rows): **0.211/0.333/0.432°C** — identical to the original number to three decimal places.
+
+**Reading the result**: Run 2's original INT8 export was *not* affected by the calibration bug
+found in Model 5f — whatever representative dataset it used originally already gave adequate
+coverage. Unlike Model 5f's Run 6/8 (where re-quantizing changed the 1hr number by 6-10x), Run 2's
+number holds exactly. This means the Run 2 vs. Model 5f Run 8 comparison
+(`../Model 5f/MODEL_5F_EXPERIMENT_LOG.md`) is trustworthy on both sides — Run 8's INT8
+0.219/0.277/0.303°C genuinely beats Run 2's 0.211/0.333/0.432°C at 2hr (17%) and 3hr (30%), with
+1hr statistically tied.
+
+**Decision**: Run 2's number stands as originally reported; no correction needed. Script:
+`requantize_trackb_run2.py`; re-quantized artifact:
+`results_5c_trackb_dense_b_run2/model_trackb_run2_int8_requant.tflite`; raw output:
+`results_5c_trackb_dense_b_run2/run2_int8_requant_n500.json`.
+
+---
+
+## Follow-up (2026-08-14) — Run 6's FP32 Export Doesn't Reproduce Its Own Claimed Number
+
+**Why**: Run 6 (`avgpool6→flat540+bottleneck(64)+wide(16)+deep(128→64+skip→32)+inter(16→sq→32)→
+merge(80)`, `seq_len=180`, 18 features) has always been treated as this project's best FP32 result
+— `results_5c_trackb_dense_b_run6.json` reports val_loss=0.000537, MAE **0.041/0.044/0.073°C**
+(1/2/3hr), "10-16x FP32 improvement" per the original breakthrough framing, with the tradeoff that
+its INT8 export is catastrophic ("+810%", never explained beyond "quantization"). To compare it
+live against Model 5f's best INT8 (Run 8), `Inference_InfluxDB_Writer.py` (generic across
+`SEQ_LEN=1/180`, feature set driven by `input_scaler.json`) was pointed at Run 6's FP32 `.tflite`
+and deployed as `model_5c_trackb_dense_b_run6_fp32` via `--run dense_b_run6 --no-tpu`, using
+`run_with_restart.py` (fixed in the same session to pass `--run` through and to track the correct
+`_fp32`-suffixed measurement — it previously hardcoded a measurement name that never matched what
+the inner script actually wrote to, for any run, a pre-existing bug unrelated to Run 6).
+
+**Live result was alarming, not just mediocre**: 30-day-equivalent live StdDev came back ~1.1°C at
+1hr — worse than most Track B runs, nowhere close to Run 8's ~0.44-0.53°C, let alone Run 6's
+claimed 0.041°C. A ~15-20x gap between claimed offline and live is far outside the live-vs-offline
+noise this project has already characterized (see Model 5f's "Live-Deployment Validation" entry —
+live windows for other models track offline numbers within a small factor, not 15-20x).
+
+**Diagnosis (script: `diagnose_run6_fp32.py`)**: before suspecting the model itself, checked the new
+live-deployment script's own feature/windowing logic against the offline validation data it should
+already agree with:
+- Ran Run 6's FP32 `.tflite` over 2,000 windows spread evenly across `val_data_sf.csv` (the same
+  split the claimed number should come from), using the identical feature-engineering pipeline
+  (`../Model 5f/requantize_int8.py`'s `load_and_engineer`, already verified via Track B Run 1/2
+  reconstruction earlier this session) and the same `sequence_length=180, sequence_stride=1,
+  sampling_rate=1` windowing convention confirmed present in `train_model_track_b.py`'s own
+  `timeseries_dataset_from_array` call. Result: **0.74/1.18/1.56°C** — consistent with the bad live
+  number, not the claimed offline one. This is evaluated on the correct data split, ruling out
+  "live conditions are harder" as the explanation.
+- Checked for the gap-splicing failure mode (windowing code slicing a post-`dropna()` array
+  positionally, silently stitching non-contiguous minutes across a dropped/missing row) that could
+  plausibly explain broad-based degradation: `val_data_sf.csv` has only 11 gaps >10 minutes and 1
+  gap >1 hour across ~557K rows. Nowhere near enough to explain a uniform ~15-20x degradation
+  across 2,000 evenly-spaced samples — ruled out quantitatively, not just by inspection.
+- Windowing/target-alignment convention cross-checked directly against `train_model_track_b.py`'s
+  own `timeseries_dataset_from_array(..., sequence_length=SEQ_LEN, sequence_stride=1,
+  sampling_rate=1, ...)` call and `AveragePooling1D(pool_size=6, strides=6)` — matches what both the
+  live script and `diagnose_run6_fp32.py` do. Feature order (`list(input_scaler.keys())`) matches
+  `results_5c_trackb_dense_b_run6.json`'s own saved `features` list.
+
+**Leading hypothesis (circumstantial, not proven)**: a weight-transfer bug during the FP32-rebuild-
+for-TFLite-export step, the same documented failure mode Model 5f's own export code explicitly
+guards against by name — *"two prior incidents of the positional version silently pairing wrong
+shapes when the two models' internal layer graphs weren't identical"* (see MODEL_5C_TRACK_B and
+MODEL_5E logs, cited in Model 5f's training scripts). Run 6's branching architecture (bottleneck +
+wide + deep + interaction paths merged) is exactly the kind of non-linear graph where a positional
+(not name-based) weight copy could silently scramble weights, while the originally-reported
+0.041/0.044/0.073°C — almost certainly measured on the live in-memory Keras model straight out of
+training, not the exported artifact — stayed correct. This would also unify two previously-separate
+observations into one root cause: both the FP32 *and* INT8 exports stem from the same rebuilt
+export model, so a broken weight transfer there would degrade both, not just INT8 as has been
+assumed throughout this project's history. **Not confirmed** — would require reconstructing Run 6's
+exact branching architecture from `checkpoints/best_model.weights.h5` and comparing layer-by-layer
+against the exported `.tflite`, complicated by `train_model_track_b.py` having been edited in place
+across ~22 runs and no longer cleanly preserving Run 6's original code (same reconstruction
+difficulty already documented for Run 1/2 above).
+
+**Decision**: **Run 6's FP32 claim is no longer trustworthy and should not be cited as this
+project's best FP32 result** — its own exported artifact fails to reproduce the number on the
+correct offline data, not just live. Not worth further investigation right now: Run 6 was never a
+deployment candidate regardless (INT8 side already dead), and reconstructing a 22-runs-ago branching
+architecture from a checkpoint is a large effort for a model that can't ship. If a validated FP32
+reference point is needed going forward, prefer Run 11 (0.091/0.092/0.121°C, a non-branching-
+adjacent architecture, though its own export has not been independently re-verified this session
+either) or Model 5f Run 8's own FP32 (already deployed, directly relevant to the FP32→INT8 gap this
+project actually cares about). `model_5c_trackb_dense_b_run6_fp32` remains live in Grafana as a
+data point but should be read as "Run 6's export, not Run 6's claimed accuracy."
+
+---
+
+## Follow-up (2026-08-14) — Same Failure Confirmed in Run 11; This Is Systemic, Not Run-6-Specific
+
+**Why**: the "prefer Run 11" recommendation above was tested directly — Run 11 (11 features, no
+`temp_diff_vs_5hr/6hr`, no humidity; architecture `avgpool6→flat330+bottleneck(64,ReLU6)+
+wide(16,ReLU6)+deep(128→64→32,ReLU6)→merge(48)`) was deployed live the same way
+(`model_5c_trackb_dense_b_run11_fp32`) before committing to a full backfill, using a generalized
+version of the Run 6 diagnostic (`diagnose_fp32_export.py --run dense_b_run11`).
+
+**Result: Run 11 fails in almost exactly the same way as Run 6.** Offline diagnostic (2,000 windows
+across `val_data_sf.csv`): **0.742/1.176/1.566°C** vs. claimed 0.091/0.092/0.121°C — 12.9x worse at
+3hr. Live Grafana (30-day-equivalent): 1hr StdDev 1.10°C, 3hr StdDev 2.39°C — consistent with the
+offline diagnostic, not the claimed number, confirmed by the user directly.
+
+**This changes the diagnosis from "Run 6 has a bug" to "this architecture family has a bug"**: Run 6
+(18 features, includes humidity/temp_diff_vs_5hr/6hr) and Run 11 (11 features, neither) are
+different checkpoints with non-overlapping feature-set specifics, yet converge to *nearly identical*
+measured MAE (0.74/1.18/1.56°C vs. 0.74/1.18/1.57°C) — both close to (and slightly worse than) the
+naive "predict-no-change" persistence baseline computed directly from `val_data_sf.csv`
+(0.56/0.96/1.33°C @ 1/2/3hr). Two structurally-different models degrading to nearly the same wrong
+answer, both landing near a trivial baseline, is inconsistent with "subtly wrong feature
+reconstruction" (which would produce noisy, model-specific garbage, not convergent near-baseline
+output) and far more consistent with a shared export defect that effectively neutralizes the
+learned wide/deep/interaction branches, leaving something close to a near-constant/trivial signal.
+
+**Reconstruction was independently re-verified against ground truth before drawing this
+conclusion** — read `train_model_track_b.py`'s actual code directly rather than trusting assumption:
+- `timeseries_dataset_from_array(data=X_*_flat, targets=y_all_*, sequence_length=180,
+  sequence_stride=1, sampling_rate=1, ...)`, with the file's own comment confirming target
+  alignment: `window X[i:i+180] uses target y[i+179]` — exactly what both diagnostic scripts and
+  `Inference_InfluxDB_Writer.py` do (`X_flat[idx-179:idx+1]` paired with `y[idx]`).
+- Scaling: `((X[feat] - lo) / (hi - lo)).clip(0.0, 1.0)` using each run's own saved
+  `input_scaler_5c_trackb.json` bounds — matches exactly (note: the `.clip(0,1)` call itself was
+  only added at Run 18 per an inline comment, so Run 6/11's *original* training may not have
+  clipped — but this only affects the ~1-2% of rows near feature extremes and cannot explain a
+  uniform ~12-20x degradation across evenly-sampled windows).
+- Gap-splicing in the windowing (positional slicing across a `dropna()`-removed row) was already
+  ruled out quantitatively in the Run 6 entry above (11 gaps >10min in ~557K rows) — same data,
+  applies equally here.
+
+**Decision**: **treat every Track B windowed/branching run (Run 6 through the Run 7-22 lineage
+that shares this bottleneck+wide+deep→merge architecture family) as unverified pending the same
+check** — this is not isolated to Run 6. Only Track B's `SEQ_LEN=1` flat, non-branching runs (Run 1,
+Run 2 — plain `Dense→BN→relu` stacks, no branching) have been independently re-verified this session
+and are trustworthy (Run 2's re-quantization reproduced its number to 3 decimal places; Run 1's FP32
+reproduction check in `requantize_trackb_run2.py`'s sibling passed within tolerance). Do not deploy
+or cite any other Track B run's FP32/INT8 number without running `diagnose_fp32_export.py --run
+<run>` first. Root cause not fully proven (would require reconstructing the exact branching graph
+from a checkpoint and comparing layer-by-layer against the exported `.tflite`). **Correction (flagged
+by user, 2026-08-14): this entry originally claimed the branching family's INT8 catastrophe was
+"already known… unrelated to this export pipeline" — that overstates it. The live-deployed INT8
+artifacts and this FP32 export share the same rebuild-export_model-then-quantize code path, so if
+that shared step scrambles weights, every historical INT8 number for this family (offline n=500
+*and* live Grafana) may have been quantizing already-garbage weights, not measuring a genuine
+architecture-level quantization limit. That question is now open, not settled — see the Run 6
+re-export follow-up below.**
+
+---
+
+## Follow-up (2026-08-14) — Every Windowed/Branching Run Checked: All 16 Fail, Confirming Systemic
+
+**Why**: rather than leave this at "Run 6 and Run 11 both fail, probably systemic," checked every
+Track B run with a claimed offline MAE, in one pass (`diagnose_all_trackb.py` — loads
+`val_data_sf.csv`/feature engineering once, ~1.5M rows, then loops all runs; the per-run version
+timed out re-loading data 20+ times).
+
+**Result: every single `SEQ_LEN=180` windowed/branching run tested fails, no exceptions.**
+
+| run | measured (1/2/3hr °C) | claimed (1/2/3hr °C) | max ratio |
+|---|---|---|---|
+| run2 (flat, non-branching) | 0.421/0.638/0.794 | 0.422/0.624/0.783 | **1.0x — OK** |
+| run6 | 0.744/1.180/1.560 | 0.041/0.044/0.073 | 26.6x |
+| run7 | 0.709/1.163/1.526 | 0.318/0.444/0.557 | 2.7x |
+| run8 | 0.745/1.179/1.576 | 0.088/0.088/0.109 | 14.5x |
+| run9 | 0.746/1.174/1.565 | 0.093/0.094/0.110 | 14.2x |
+| run10 | 0.745/1.179/1.565 | 0.094/0.100/0.120 | 13.1x |
+| run11 | 0.742/1.176/1.566 | 0.091/0.092/0.121 | 12.9x |
+| run12 | 2.273/2.317/2.038 | 2.232/2.047/1.005 | 2.0x |
+| run13 | 0.742/1.176/1.566 | 0.091/0.092/0.121 | 12.9x |
+| run14 | 0.740/1.180/1.577 | 0.094/0.096/0.118 | 13.4x |
+| run16 | 0.717/1.175/1.552 | 0.088/0.108/0.138 | 11.3x |
+| run17 | 0.718/1.176/1.559 | 0.079/0.095/0.122 | 12.7x |
+| run18 | 0.718/1.176/1.559 | 0.075/0.090/0.116 | 13.4x |
+| run19 | 0.882/1.166/1.573 | 0.111/0.128/0.157 | 10.0x |
+| run20 | 0.722/1.179/1.559 | 0.071/0.084/0.109 | 14.3x |
+| run21 | 0.721/1.177/1.559 | 0.068/0.080/0.105 | 14.9x |
+| run22 | 0.723/1.180/1.560 | 0.068/0.080/0.105 | 14.8x |
+
+`run1`, `run3`, `run4`, `run5` (the pre-breakthrough `SEQ_LEN=1` flat runs) couldn't be checked —
+`diagnose_all_trackb.py` inherited its feature pipeline from Model 5f's `load_and_engineer`, which
+never computes those runs' specific raw-lag (`temp_lag60/120/180`, `humidity_lag60`) or
+wind-direction cyclical features. Not evidence either way for those four; just unchecked. `run2`
+(also flat/non-branching, 23 features) checked clean (1.0x) via the same shared pipeline, so the
+gap is a feature-plumbing limitation, not a fundamental blocker — just not worth extending for four
+runs already known to be non-competitive on their own claimed numbers (0.42-0.94°C 1hr MAE range).
+
+**The remarkable pattern**: measured MAE for run8 through run22 (14 checkpoints spanning
+`n_features` 11-14 and many documented architectural changes — BatchNorm removal, ReLU6 swaps,
+interaction-path removal, calibration fixes) clusters extremely tightly: ~0.72-0.75°C / ~1.17-1.18°C
+/ ~1.55-1.58°C, almost regardless of which specific checkpoint. Followed up with a targeted test to
+distinguish "these are 14 independently-broken checkpoints that happen to converge" from "the same
+structural defect produces similarly-wrong output across a shared architecture family": fed Run 11's
+FP32 model constant input (all-zero, all-0.5, all-1.0) and three different random-uniform inputs.
+Constant input gave near-flat output (as expected — no information to work with); **random inputs
+gave clearly varied, multi-degree-magnitude outputs** (e.g. +2.6/+4.1/-7.2°C vs. +1.2/+0.3/+4.3°C vs.
++2.6/+6.6/+9.1°C for three different random draws) — ruling out "the interpreter isn't reading input
+at all" (that would produce identical output regardless of input). This is consistent with a model
+that **is** computing something genuinely input-dependent, just not the correct mapping from real
+features to real targets — exactly what a shared weight-scrambling defect (e.g. wide/deep branch
+weights swapped or misassigned) baked into a reused export code path would produce: each checkpoint
+computes something different from the others internally, but all are similarly "confidently wrong"
+in a way that produces similar-magnitude (not identical) error against the same real target
+distribution.
+
+**Ground-truth cross-checks performed before concluding this (not assumed)**: `timeseries_dataset_
+from_array(sequence_length=180, sequence_stride=1, sampling_rate=1)` and its target-alignment
+comment (`window X[i:i+180] uses target y[i+179]`) — matches exactly. Target rescale formula
+(`2.0*(raw-y_min)/(y_max-y_min)-1.0` forward, `(pred+1)*0.5*(y_max-y_min)+y_min` inverse) — matches
+exactly, line-for-line, including in the script's own INT8 eval block. Input scaling
+(`((x-lo)/(hi-lo)).clip(0,1)`) — matches. Gap-splicing in windowing — ruled out quantitatively (11
+gaps >10min in ~557K rows). Feature order — matches each run's saved `results.json`. None of these
+explain the discrepancy, which is why the conclusion points at the model exports themselves rather
+than at this session's reconstruction.
+
+**Decision**: **only Track B Run 2 is confirmed trustworthy** (1.0x, matches its claimed number
+exactly, independently re-verified twice now — once via `requantize_trackb_run2.py`'s FP32
+reproduction gate, once via this broader sweep). Every `SEQ_LEN=180` windowed/branching run checked
+(6-22, 16 of 16) fails to reproduce its own claimed FP32 accuracy by 2-27x. Root mechanism not
+fully proven (would require reconstructing a branching architecture from its checkpoint and
+diffing layer-by-layer against its `.tflite` export), but the evidence is now comprehensive, not
+circumstantial: every tested run in the family fails, the failure mode is consistent with a shared
+export defect rather than per-run corruption, and the one architecturally-different (non-branching)
+run in the family (Run 2) is the one that passes cleanly.
+
+**Revised scope of the damage (corrected 2026-08-14, flagged by user)**: the original version of
+this entry claimed this "does NOT affect the project's actual deployment decisions" since those
+were "separately confirmed via live Coral EdgeTPU deployment data… unrelated to this export
+pipeline." **That's not established — it's the opposite of established.** The live-deployed INT8
+artifact for every branching run and the FP32 export just tested here both descend from the same
+rebuild-export_model-then-quantize step. If that step is where weights get scrambled, then the live
+"Run 2 beats Run 11" result (2026-08-12) may reflect Run 2 being architecturally better *and*
+structurally immune to this bug (linear chain, no branching to scramble) rather than Run 11's deep/
+windowed architecture being fundamentally worse at quantization. **The entire "deep windowed
+architectures don't quantize well" conclusion — the premise that justified building Model 5d, 5e,
+and 5f — is now genuinely open, not settled.** See the follow-up below: rather than accept that
+open question, re-export an existing checkpoint (already-trained weights, no retraining needed)
+correctly and re-test INT8 directly, before committing to a larger architecture-search effort.
+Scripts: `diagnose_all_trackb.py` (full sweep), `diagnose_fp32_export.py` (single-run, still useful
+for spot-checking rank-2 exports it's actually built for). Raw output:
+`diagnose_all_trackb_results.json`.
+
+---
+
+## Follow-up (2026-08-14) — Plan: Re-Export an Existing Checkpoint Correctly, Test If INT8 Was Ever Fairly Measured
+
+**Why**: user correctly flagged that the previous entry's framing ("doesn't affect deployment
+decisions… unrelated to this export pipeline") was unjustified — the live-deployed INT8 artifacts
+that drove the pivot away from deep/windowed architectures share the same rebuild-then-quantize
+step as the broken FP32 export found here. Whether "deep architectures don't quantize well" is a
+real architectural limit or partly/wholly an artifact of this export bug is now genuinely open.
+Cheapest way to answer it: the trained weights already exist correctly in each run's
+`checkpoints/best_model.weights.h5` (saved directly from the training model, before the suspected
+buggy rebuild step) — re-export one checkpoint *correctly* and re-test INT8, no retraining needed.
+
+**Target changed from Run 6 to Run 22**: user's original suggestion was Run 6, but Run 6's
+"interaction path" (element-wise square) was removed at Run 7 specifically for being "hostile to
+INT8 (+810% Run 6)" — a real, already-correctly-diagnosed, unrelated problem confirmed via
+`train_model_track_b.py`'s own inline comment (line 963) and cross-checked against git history
+(both preserved commits already postdate the removal — Run 6's exact original code is not
+recoverable, would require reconstructing a removed component from architecture-string + shape
+guesswork). Run 22 is a cleaner target: it's the run `train_model_track_b.py` is *currently*
+configured for (`RUN_NAME = "dense_b_run22"`, `DEEP_OUT_PRESCALE = 10.0`,
+`DEEP_OUT_RESCALE = 0.2735` all match `results_5c_trackb_dense_b_run22.json`'s architecture string
+exactly) — meaning the model-building code doesn't need to be reconstructed or guessed at all, it's
+the actual surviving code. It also has no interaction path (removed 15 runs earlier), so testing it
+isolates the export-bug question cleanly without Run 6's separate confound.
+
+**Verification-order caution**: raw H5 checkpoint inspection showed `dense_1`'s shape (64,128)
+matches the `deep1` layer, not `wide` (64,16) — despite `wide` being instantiated earlier in the
+source code (line 983) than `deep1` (line 988). This means naive positional/creation-order
+H5-group-to-layer matching would have been wrong. Decided against hand-reconstructing via raw H5
+inspection for this reason — using `model.load_weights(checkpoint_path)` instead, the same native
+Keras API this exact script already uses successfully for its own warm-start/resume paths (Run 22
+itself was warm-started from Run 20's checkpoint this way), which handles the matching internally
+and consistently in both directions since it's the same Keras version reading its own write format.
+
+**Plan**: (1) rebuild Run 22's exact architecture using the verbatim model-building code currently
+in `train_model_track_b.py`; (2) `model.load_weights()` from
+`results_5c_trackb_dense_b_run22/checkpoints/best_model.weights.h5`; (3) evaluate FP32 MAE on
+`val_data_sf.csv` via the already-verified `load_and_engineer` pipeline and compare against Run 22's
+claimed 0.068/0.080/0.105°C — the gate before trusting anything further; (4) if it passes, re-export
+to TFLite avoiding the suspected buggy step entirely (convert the original model directly via
+`tf.function`+`get_concrete_function`, skipping the "rebuild a second export_model and copy weights
+into it" pattern used elsewhere in this project) and re-run INT8 quantization using the
+already-fixed prediction-stratified calibration from Model 5f's `requantize_int8.py`; (5) see what
+INT8 accuracy actually looks like on a correctly-exported deep/windowed model.
+
+**Results (2026-08-14)**: reconstructed Run 22's exact architecture verbatim from
+`train_model_track_b.py`'s current (verified-matching) model-building code, loaded
+`checkpoints/best_model.weights.h5` via native `model.load_weights()` (no shape-mismatch error —
+strong evidence every non-head layer, all of which have unique shapes, loaded correctly), and
+evaluated with plain Keras `.predict()` — **no TFLite involved at all**. Result: still
+0.729/1.147/1.541°C vs. claimed 0.068/0.080/0.105°C (10-15x off). **This rules out the TFLite
+export step as the cause** — the discrepancy exists at the native-Keras-checkpoint level, before
+any conversion happens. Stopped before re-exporting/re-testing INT8, since there's no verified-good
+FP32 baseline to re-export from yet.
+
+**Systematically tested and ruled out every mechanism found so far, each with a direct test, not
+just inspection**:
+- **Metric-extraction formula** (the `eval_results[4]*scale` pattern): built a controlled test with
+  known predictions vs. known targets, computed MAE/MSE manually, and confirmed `eval_results`
+  indices [1,2,3,4,5,6] exactly match [mse1,mse2,mse3,mae1,mae2,mae3] as the code assumes. Formula
+  is correct.
+- **Gap-splicing in windowing** — re-examined more carefully after the first pass only checked raw
+  CSV timestamp gaps (11 gaps >10min). The real risk is `dropna()` removing *scattered* rows
+  (sensor-glitch-nulled temperature, mostly) and positional window-slicing silently splicing
+  across them: found 4,699 positions (0.87%) with a skipped row immediately prior, meaning ~53% of
+  180-length windows contain at least one splice. Filtered evaluation to the strictly gap-free 53%
+  subset — **result unchanged** (0.757/1.202/1.508°C). Not the cause, despite being a real
+  (separate, worth fixing eventually) data-quality issue.
+- **Head-swapping** (the three (48,1)-shaped output heads are shape-ambiguous, unlike every other
+  layer): tried all 6 permutations of pred-head-to-true-target assignment. The unpermuted order is
+  already the best fit — no swap improves it. Ruled out.
+- Windowing/target-alignment and input-scaling formulas were already verified against the actual
+  training code in the entry above.
+
+**Where this leaves things**: every mechanism identified so far — TFLite export, calibration,
+metric formula, gap-splicing, head assignment — has been directly tested and ruled out. The
+checkpoint loads cleanly and matches its own architecture exactly, yet doesn't reproduce its
+claimed accuracy even via the most direct possible evaluation path. Remaining candidates, not yet
+tested: (a) a bug in checkpoint *saving* itself — e.g. the "best" epoch tracking/restore logic
+saving the wrong weights despite reporting the right metric at the time; (b) training's own
+internal validation used a different (smaller, or differently-filtered) slice of data than the
+full `val_data_sf.csv` this session evaluates against, making the original claimed number
+genuinely un-reproducible from the full validation set even by the original training run's own
+logic. Training's own loss history (`results.json`'s `history.val_loss`, converging to ~0.0004 and
+flat for the last several of 155 epochs) is consistent with genuine convergence to good accuracy,
+which argues against "training never really achieved this" and toward "something about
+reproducing that number after the fact doesn't match how it was originally produced."
+
+**Decision**: this is now a deeper, more fundamental question than the original "fix the export
+step" plan assumed — the checkpoints themselves don't reproduce their claimed accuracy, independent
+of export. Escalating to user rather than continuing to guess further.
+
+---
+
+## Follow-up (2026-08-14) — RESOLVED: The Bug Was in This Session's Own Diagnostics, Not the Checkpoints
+
+**Root cause found, and it reverses the "systemic export bug" conclusion above.** Ran the actual,
+unmodified `train_model_track_b.py` itself (temporarily: `RUN_NAME` redirected to a throwaway
+`_verify` results directory so real files were never touched, `SKIP_TRAINING=True`,
+`SOURCE_CHECKPOINT` pointed at Run 22's real checkpoint, `WARM_START=False` to remove any
+confound — reverted via `git checkout` immediately after capturing output). Its own "Final
+Evaluation" block reproduced the claimed number **exactly**: `diff_1hr: 0.068°C, diff_2hr: 0.080°C,
+diff_3hr: 0.105°C`, `val_loss: 0.000400` — matching `results_5c_trackb_dense_b_run22.json` and the
+converged training history precisely. **The checkpoint is genuinely good.**
+
+Isolated the actual discrepancy by reproducing the script's own `tf.keras.utils.
+timeseries_dataset_from_array(...)`-based `val_ds` directly and computing MAE over **all ~539,505
+windows** (not a small sample): **0.0676 / 0.0802 / 0.1050°C — matches the claim.** This session's
+entire diagnostic sweep (`diagnose_all_trackb.py`, `diagnose_fp32_export.py`,
+`verify_run22_export.py`) evaluated only 500–2000 evenly-spaced windows per run, not the full
+population. **That was the bug.** The per-window error distribution for this architecture family is
+heavy-tailed — most predictions are excellent, a minority are large misses (consistent with the
+sample-level table logged in the previous entry: several close matches, several severe outliers) —
+and a small evenly-spaced sample of a heavy-tailed distribution is a statistically unreliable
+estimator of the population mean. The *same* small-sample methodology reproduced Track B Run 1 and
+Run 2 exactly, because those evaluations used the full validation set for the FP32-reproduction
+gate (`requantize_trackb_run2.py`), not a small subsample — the flaw was specific to this session's
+newer diagnostic scripts, introduced when testing the windowed architecture family, not a
+pre-existing pattern.
+
+**This retracts, in full, every "systemic export bug" / "weight-scrambling" conclusion from the
+three entries above.** There is no evidence of a TFLite export defect, a weight-transfer bug, or
+checkpoint corruption anywhere in Run 6–22. Every one of those runs' claimed offline FP32 numbers
+should be presumed valid unless specifically re-checked with a full-population evaluation (not
+`diagnose_all_trackb.py`'s 500–2000-sample sweep, which should not be trusted for this architecture
+family and should not be used again in its current form).
+
+**What does NOT change**: the still-open, separate puzzle is why live Grafana deployment of
+Run 6's and Run 11's FP32 exports (`model_5c_trackb_dense_b_run6_fp32`,
+`..._run11_fp32`, ~30-day-equivalent live StdDev 1.1-2.4°C) looks nothing like the now-confirmed
+population-level offline MAE (~0.07-0.12°C for Run 11). Since the checkpoints are confirmed good
+and the export pipeline is now unimplicated, this is most likely a genuine live-vs-historical
+generalization gap (concept drift / seasonal distribution shift between the training-era validation
+window and current live conditions) or a difference between the offline pipeline's sensor-glitch
+filtering (`_sanity_filter_temperature`, applied to `val_data_sf.csv`) and whatever
+`Inference_InfluxDB_Writer.py` applies to live-streamed InfluxDB data — not a checkpoint or export
+defect. Not yet investigated; worth checking if this question resurfaces.
+
+**Corrected practical conclusion**: Model 5c Track B's deep/windowed architecture family (Run
+6-22) may be exactly as accurate offline as originally claimed — the earlier "not deployable, FP32
+claims unverified" framing in this log was wrong, and stemmed entirely from this session's own
+flawed small-sample diagnostics. Their INT8 catastrophe (independently and repeatedly measured via
+proper n=500 methodology, and via real Coral EdgeTPU live deployment, both long predating this
+session's confusion) remains real and unexplained by anything found here — that conclusion was
+never actually in doubt; only the (retracted) claim that the underlying FP32 checkpoints were also
+compromised. The strategic pivot to shallow architectures ([[project_model5d]]/5e/5f) remains sound
+regardless. Scripts from this investigation (`verify_run22_export.py`,
+`diagnose_all_trackb.py`, `diagnose_fp32_export.py`, `diagnose_run6_fp32.py`) should not be reused
+for FP32 verification without fixing them to evaluate the full population, not a small sample.

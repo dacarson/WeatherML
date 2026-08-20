@@ -4,19 +4,14 @@ from influxdb import InfluxDBClient
 
 SCRIPT       = "Inference_InfluxDB_Writer.py"
 DEFAULT_TPUS = "auto"
+DEFAULT_RUN  = "5f_run1"
 MAX_TPU_PROBE = 8
-DEFAULT_RUN  = "dense_b_run17"
 
 
-def _locations_for(run_name):
-    # Must match Inference_InfluxDB_Writer.py's own LOCATIONS measurement naming exactly —
-    # previously hardcoded without the run suffix at all ("model_5c_trackb"), which never
-    # matched what the inner script actually wrote to (a pre-existing bug, not introduced here).
+def _locations_for(run_name: str):
     return {
-        "sf": {"db": "weather", "measurement": f"model_5c_trackb_{run_name}",
-               "label": "San Francisco"},
-        "ps": {"db": "ps_smartweather", "measurement": f"model_5c_trackb_ps_{run_name}",
-               "label": "Palm Springs"},
+        "sf": {"db": "weather",         "measurement": f"model_{run_name}",    "label": "San Francisco"},
+        "ps": {"db": "ps_smartweather", "measurement": f"model_{run_name}_ps", "label": "Palm Springs"},
     }
 
 
@@ -65,7 +60,7 @@ def _check_last_timestamp(db, measurement):
 
 
 parser = argparse.ArgumentParser(
-    description="Run Model 5c Track B inference with TPU rotation and auto-restart.")
+    description="Run Model 5f inference with TPU rotation and auto-restart.")
 parser.add_argument("--tpus", default=DEFAULT_TPUS,
     help='Comma-separated TPU IDs, or "auto" to discover (default: auto).')
 parser.add_argument("--fresh", action="store_true",
@@ -73,8 +68,8 @@ parser.add_argument("--fresh", action="store_true",
 parser.add_argument("--no-tpu", action="store_true",
     help="Disable EdgeTPU; use FP32 model on CPU (Mac development / no Coral TPU).")
 parser.add_argument("--run", default=DEFAULT_RUN,
-    help="Trained run to serve — passed through to Inference_InfluxDB_Writer.py's --run, "
-         f"e.g. dense_b_run17, dense_b_run6 (default: {DEFAULT_RUN}).")
+    help="Trained run to serve, e.g. 5f_run1, 5f_run5 (selects ./results_<run> and the "
+         f"model_<run> InfluxDB measurement). Default: {DEFAULT_RUN}.")
 parser.add_argument("--location", choices=["sf", "ps"], default="sf",
     help="Weather data source: sf (San Francisco, default) or ps (Palm Springs).")
 args = parser.parse_args()
@@ -85,7 +80,7 @@ DB          = loc["db"]
 MEASUREMENT = loc["measurement"]
 if args.no_tpu:
     MEASUREMENT = f"{MEASUREMENT}_fp32"  # must match Inference_InfluxDB_Writer.py's FP32 suffix
-print(f"📍 Location: {loc['label']} | Run: {args.run} | DB: {DB} | Measurement: {MEASUREMENT}")
+print(f"📍 Location: {loc['label']} | DB: {DB} | Measurement: {MEASUREMENT}")
 
 if args.fresh:
     print(f"🧹 --fresh: dropping '{MEASUREMENT}' from '{DB}'...")

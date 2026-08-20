@@ -1,14 +1,18 @@
-# Inference_InfluxDB_Writer.py — Model 5c Track B Dense
+# Inference_InfluxDB_Writer.py — Model 5f
 #
 # Runs inference using the INT8 TFLite model on Coral Edge TPU (falls back to FP32
 # TFLite on CPU when no TPU delegate is available, e.g. Mac development).
 #
-# Compatible with Runs 1–5 (SEQ_LEN=1, flat feature vector), Run 6-15 (SEQ_LEN=180,
-# 3-hour sliding window + AveragePooling), and Run 16+ (adds temp_diff_vs_5hr/6hr
-# scalar lag features). The sequence length and feature set are both detected
-# automatically (SEQ_LEN from the model's input shape, features from input_scaler.json)
-# — no code change needed when switching between runs, as long as every feature a
-# given run's input_scaler.json references has a corresponding column computed below.
+# Follows the Model 5c Track B convention (RUN_NAME-driven config, auto-detected
+# feature set from input_scaler.json, gap-aware lag / rolling-slope feature parity
+# with training). One difference from Track B: Run 1's input tensor is a genuinely
+# flat (1, FEATURE_COUNT) vector — no sequence dimension at all (unlike Track B's
+# SEQ_LEN=1 runs, which still use a (1, 1, FEATURE_COUNT) 3-D input). This script
+# detects the input rank and handles both shapes so future 5f runs work unmodified
+# whichever way they're built, as long as every feature a given run's
+# input_scaler.json references has a corresponding column computed below. Run 7
+# added illuminance_diff_1hr / solar_radiation_diff_1hr / uv_diff_1hr (backward
+# 1hr diffs, same construction as temp_diff_vs_5hr/6hr) on top of Run 5's feature set.
 #
 # Predictions are stored at the TARGET timestamp (T+1hr, T+2hr, T+3hr) so that
 # Grafana shows them as a forward-looking fan from "now".
@@ -23,7 +27,7 @@ import sys
 import argparse
 
 QUERY_BATCH_SIZE  = 250_000   # minutes of weather data per batch (≈55 days)
-WARM_UP_MINUTES   = 420      # lookback for 360-min temp_diff_vs_6hr lag (Run 16+) + 60-min buffer
+WARM_UP_MINUTES   = 420      # lookback for 360-min temp_diff_vs_6hr lag + 60-min buffer
 BACKFILL_HOURS    = 3        # re-run last N hours to add newly-available actuals
 EXTRA_SAMPLES     = 250      # extra buffer past batch window
 
@@ -113,18 +117,19 @@ def _future_temp_at(df_index, temperatures, offset, tol_s=90):
     return merged["temperature"].to_numpy(dtype=np.float32)
 
 
-def _past_temp_at(df_index, temperatures, offset, tol_s=90):
-    """Return past temperature at (t - offset) via backward merge_asof.
-    Matches the training pipeline's _add_past_lags (temp_diff_vs_5hr/6hr, Run 16+) —
-    deliberately NOT gap_aware_lag's reindex(method="nearest"), which can match a
-    reading slightly AFTER the lookup time; training only ever looks backward."""
+def _past_value_at(df_index, values, offset, tol_s=90):
+    """Return past value of an arbitrary series at (t - offset) via backward merge_asof.
+    Matches the training pipeline's _add_past_lags (temp_diff_vs_5hr/6hr, and Run 7's
+    illuminance/solar_radiation/uv_diff_1hr) — deliberately NOT gap_aware_lag's
+    reindex(method="nearest"), which can match a reading slightly AFTER the lookup
+    time; training only ever looks backward."""
     tol = pd.Timedelta(seconds=tol_s)
     base = pd.DataFrame({"base_time": df_index})
     base["lookup_time"] = base["base_time"] - offset
-    src  = pd.DataFrame({"src_time": df_index, "temperature": temperatures})
+    src  = pd.DataFrame({"src_time": df_index, "value": values})
     merged = pd.merge_asof(base, src, left_on="lookup_time", right_on="src_time",
                            direction="backward", tolerance=tol)
-    return merged["temperature"].to_numpy(dtype=np.float32)
+    return merged["value"].to_numpy(dtype=np.float32)
 
 
 def predict_on_window(window_norm, interpreter, input_index, input_scale, input_zero_point,
@@ -132,10 +137,8 @@ def predict_on_window(window_norm, interpreter, input_index, input_scale, input_
                       input_buffer, use_int8, y_min, y_max):
     """Run one inference step.
 
-    window_norm: (SEQ_LEN, FEATURE_COUNT) float32 in [0, 1].
-    For SEQ_LEN=1 (Runs 1-5) this is a single-row window (1, FEATURE_COUNT).
-    For SEQ_LEN=180 (Run 6+) this is a 3-hour rolling window (180, FEATURE_COUNT).
-    input_buffer must have shape (1, SEQ_LEN, FEATURE_COUNT).
+    window_norm: (FEATURE_COUNT,) for flat (rank-2) inputs, or (SEQ_LEN, FEATURE_COUNT)
+    for windowed (rank-3) inputs — shape must match input_buffer[0].
     """
     start = time.perf_counter()
 
@@ -189,17 +192,16 @@ def create_influx_points(base_timestamp, actuals, diffs_c, current_temp):
 # Parse arguments
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(
-    description="Run Model 5c Track B inference and write to InfluxDB.")
+    description="Run Model 5f inference and write to InfluxDB.")
 parser.add_argument("--tpu", default="",
     help="EdgeTPU device selector (e.g. 0, :0, usb:0). Leave empty to auto-select.")
 parser.add_argument("--no-tpu", action="store_true",
     help="Disable EdgeTPU delegate; use FP32 model on CPU (Mac dev / no TPU).")
 parser.add_argument("--cpu-int8", action="store_true",
     help="Run INT8 model on CPU without EdgeTPU delegate (faster than EdgeTPU for tiny models).")
-parser.add_argument("--run", default="dense_b_run17",
-    help="Trained run to serve, e.g. dense_b_run17, dense_b_run6 (selects "
-         "./results_5c_trackb_<run> and the model_5c_trackb_<run> InfluxDB measurement). "
-         "Default: dense_b_run17 (preserves this script's original hardcoded behavior).")
+parser.add_argument("--run", default="5f_run1",
+    help="Trained run to serve, e.g. 5f_run1, 5f_run5 (selects ./results_<run> and the "
+         "model_<run> InfluxDB measurement). Default: 5f_run1.")
 parser.add_argument("--location", choices=["sf", "ps"], default="sf",
     help="Weather data source: sf (San Francisco, default) or ps (Palm Springs).")
 args = parser.parse_args()
@@ -208,13 +210,13 @@ args = parser.parse_args()
 # Configuration — RUN_NAME selects which trained run to serve
 # ---------------------------------------------------------------------------
 RUN_NAME    = args.run
-RESULTS_DIR = f"./results_5c_trackb_{RUN_NAME}"
+RESULTS_DIR = f"./results_{RUN_NAME}"
 
-MODEL_EDGETPU_PATH = f"{RESULTS_DIR}/model_trackb_{RUN_NAME}_int8_edgetpu.tflite"
-MODEL_INT8_PATH    = f"{RESULTS_DIR}/model_trackb_{RUN_NAME}_int8.tflite"
-MODEL_FP32_PATH  = f"{RESULTS_DIR}/model_trackb_{RUN_NAME}_fp32.tflite"
-INPUT_SCALER_PATH  = f"{RESULTS_DIR}/input_scaler_5c_trackb.json"
-TARGET_SCALER_PATH = f"{RESULTS_DIR}/target_scaler_5c_trackb.json"
+MODEL_EDGETPU_PATH = f"{RESULTS_DIR}/model_5f_{RUN_NAME}_int8_edgetpu.tflite"
+MODEL_INT8_PATH    = f"{RESULTS_DIR}/model_5f_{RUN_NAME}_int8.tflite"
+MODEL_FP32_PATH    = f"{RESULTS_DIR}/model_5f_{RUN_NAME}_fp32.tflite"
+INPUT_SCALER_PATH  = f"{RESULTS_DIR}/input_scaler_5f.json"
+TARGET_SCALER_PATH = f"{RESULTS_DIR}/target_scaler_5f.json"
 
 # ---------------------------------------------------------------------------
 # Location profiles — controls which InfluxDB database to read/write
@@ -222,12 +224,12 @@ TARGET_SCALER_PATH = f"{RESULTS_DIR}/target_scaler_5c_trackb.json"
 LOCATIONS = {
     "sf": {
         "db":          "weather",
-        "measurement": f"model_5c_trackb_{RUN_NAME}",
+        "measurement": f"model_{RUN_NAME}",
         "label":       "San Francisco",
     },
     "ps": {
         "db":          "ps_smartweather",
-        "measurement": f"model_5c_trackb_ps_{RUN_NAME}",
+        "measurement": f"model_{RUN_NAME}_ps",
         "label":       "Palm Springs",
     },
 }
@@ -299,7 +301,7 @@ if not use_int8:
     print(f"Loading FP32 TFLite model (CPU): {model_path}")
     interpreter = tflite.Interpreter(model_path=model_path)
     # FP32 and INT8 runs must not share a measurement — otherwise this would overwrite/interleave
-    # with an existing INT8 series in the same "model_5c_trackb_<run>" measurement, making the two
+    # with the existing INT8 series in the same "model_<run>" measurement, making the two
     # impossible to compare as separate Grafana traces.
     MEASUREMENT = f"{MEASUREMENT}_fp32"
     print(f"  ℹ️  FP32 mode: writing to measurement '{MEASUREMENT}' (kept separate from INT8's "
@@ -314,15 +316,15 @@ print(f"  Output shapes: {[output_details[k]['shape'] for k in range(3)]}")
 input_index, input_scale, input_zero_point, output_indices, output_scales, output_zero_points = \
     _extract_interpreter_constants(input_details, output_details)
 
-# Detect SEQ_LEN from the model's input shape — (1, SEQ_LEN, FEATURE_COUNT).
-# Runs 1-5: SEQ_LEN=1 (flat feature vector). Run 6+: SEQ_LEN=180 (3-hour window).
-SEQ_LEN = int(input_details[0]["shape"][1])
-print(f"  SEQ_LEN: {SEQ_LEN} (detected from model input shape)")
+# Detect input layout from the model's input shape.
+# Rank 3 (1, SEQ_LEN, FEATURE_COUNT): Track-B-style windowed input.
+# Rank 2 (1, FEATURE_COUNT): Model 5f's genuinely flat vector — no sequence dim at all.
+INPUT_SHAPE = tuple(int(d) for d in input_details[0]["shape"])
+INPUT_RANK  = len(INPUT_SHAPE)
+SEQ_LEN     = INPUT_SHAPE[1] if INPUT_RANK == 3 else 1
+print(f"  Input rank: {INPUT_RANK} | SEQ_LEN: {SEQ_LEN} (detected from model input shape)")
 
-if use_int8:
-    input_buffer = np.empty((1, SEQ_LEN, FEATURE_COUNT), dtype=np.int8)
-else:
-    input_buffer = np.empty((1, SEQ_LEN, FEATURE_COUNT), dtype=np.float32)
+input_buffer = np.empty(INPUT_SHAPE, dtype=np.int8 if use_int8 else np.float32)
 
 # ---------------------------------------------------------------------------
 # Determine resume point
@@ -407,31 +409,40 @@ df["humidity_slope_30"] = rolling_slope(df["relative_humidity"].values, 60)  # w
 df["pressure_slope_60"] = rolling_slope(df["station_pressure"].values, 60)
 print("   ✅ Slopes computed")
 
-# Gap-aware lags (Run 1: raw lags; Run 2: signed diffs — auto-selected via FEATURE_ORDER)
+# Gap-aware lags (kept for parity with the Track B pipeline; unused columns are
+# simply ignored since FEATURE_ORDER is driven by input_scaler.json)
 print("⚙️  Computing gap-aware lag features...")
 _temp_lag60  = gap_aware_lag(df["temperature"], 60)
 _temp_lag120 = gap_aware_lag(df["temperature"], 120)
 _temp_lag180 = gap_aware_lag(df["temperature"], 180)
-
-# Raw lags (Run 1 features)
 df["temp_lag60"]  = _temp_lag60
 df["temp_lag120"] = _temp_lag120
 df["temp_lag180"] = _temp_lag180
-# Signed diffs (Run 2 features)
 df["temp_diff_vs_1hr"] = df["temperature"] - _temp_lag60
 df["temp_diff_vs_2hr"] = df["temperature"] - _temp_lag120
 df["temp_diff_vs_3hr"] = df["temperature"] - _temp_lag180
-
 df["pressure_lag120"] = gap_aware_lag(df["station_pressure"], 120)
 df["pressure_lag180"] = gap_aware_lag(df["station_pressure"], 180)
 df["humidity_lag60"]  = gap_aware_lag(df["relative_humidity"], 60)
 
-# Run 16+ features: temp_diff_vs_5hr/6hr (Track A Deep Run non-boundary attention anchor).
+# temp_diff_vs_5hr/6hr — Model 5f's curated feature set.
 temperatures_arr = df["temperature"].values.astype(np.float32)
-_temp_lag300 = _past_temp_at(df.index, temperatures_arr, pd.Timedelta(minutes=300))
-_temp_lag360 = _past_temp_at(df.index, temperatures_arr, pd.Timedelta(minutes=360))
+_temp_lag300 = _past_value_at(df.index, temperatures_arr, pd.Timedelta(minutes=300))
+_temp_lag360 = _past_value_at(df.index, temperatures_arr, pd.Timedelta(minutes=360))
 df["temp_diff_vs_5hr"] = temperatures_arr - _temp_lag300
 df["temp_diff_vs_6hr"] = temperatures_arr - _temp_lag360
+
+# illuminance/solar_radiation/uv 1hr backward diffs — Run 7's new trend features.
+# Unused columns are ignored since FEATURE_ORDER is driven by input_scaler.json.
+illuminance_arr = df["illuminance"].values.astype(np.float32)
+solar_arr       = df["solar_radiation"].values.astype(np.float32)
+uv_arr          = df["uv"].values.astype(np.float32)
+_illuminance_lag60 = _past_value_at(df.index, illuminance_arr, pd.Timedelta(minutes=60))
+_solar_lag60        = _past_value_at(df.index, solar_arr, pd.Timedelta(minutes=60))
+_uv_lag60            = _past_value_at(df.index, uv_arr, pd.Timedelta(minutes=60))
+df["illuminance_diff_1hr"]     = illuminance_arr - _illuminance_lag60
+df["solar_radiation_diff_1hr"] = solar_arr - _solar_lag60
+df["uv_diff_1hr"]              = uv_arr - _uv_lag60
 print("   ✅ Lags computed")
 
 # Future targets for backfilling actuals
@@ -507,12 +518,13 @@ prediction_points = []
 _timing_reported = False  # print one-shot timing after first prediction for sanity-check
 
 for i in range(start_index, len(df)):
-    # For SEQ_LEN=1 (Runs 1-5): window is a single row (1, FEATURE_COUNT).
-    # For SEQ_LEN=180 (Run 6+): window is a 3-hour rolling slice (180, FEATURE_COUNT).
     if i < SEQ_LEN - 1:
         continue  # not enough history to fill the window yet
 
-    window_norm = scaled_data[i - SEQ_LEN + 1:i + 1]  # (SEQ_LEN, FEATURE_COUNT)
+    if INPUT_RANK == 3:
+        window_norm = scaled_data[i - SEQ_LEN + 1:i + 1]  # (SEQ_LEN, FEATURE_COUNT)
+    else:
+        window_norm = scaled_data[i]  # (FEATURE_COUNT,) — Model 5f's flat vector
 
     targets_row = targets_arr[i]
     actuals = None if np.any(np.isnan(targets_row)) else targets_row
