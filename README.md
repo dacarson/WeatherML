@@ -541,6 +541,21 @@ python Inference_InfluxDB_Writer.py
 
 ---
 
+## Related Project: SolarChargeML
+
+**Directory**: `workspace/SolarChargeML/`
+
+A separate initiative that lives in this repo because it reuses the same Tempest weather station data (`solar_radiation`, `illuminance`, `uv`, wind, etc.) as a feature source — but it doesn't predict temperature. It predicts **excess solar power 5 minutes ahead**, as a candidate drop-in replacement for the average+slope heuristic in a companion project,
+[ChargePoint-SunPower-ChargeManager](https://github.com/dacarson/ChargePoint-SunPower-ChargeManager)'s `solar_charge_controller.py`, which throttles EV charging amperage to track available solar excess (biasing toward grid draw off-peak, toward export on-peak) through passing clouds, fog, and unscheduled house loads.
+
+**Method**: `sklearn.ensemble.HistGradientBoostingRegressor` (gradient-boosted trees, not TensorFlow — chosen for lightweight CPU inference on the same Raspberry Pi that runs the charge controller), trained on 30-second-resolution InfluxDB features joining PVS6 solar/load data with this repo's WeatherFlow station data, daytime-only. Predicts the *delta* from current excess rather than the raw value — see the experiment log for why a 1-minute grid and three earlier target/feature reformulations all failed to beat the heuristic before finer time resolution did.
+
+**Status**: offline backtest beats the existing heuristic by 5.6% MAE (and naive persistence by 11.1%). A read-only shadow validator is now running live on the deployed Raspberry Pi, logging what the model would predict alongside the real controller's own predictions for direct comparison — not yet controlling real charging.
+
+Full detail: `workspace/SolarChargeML/SOLARCHARGE_PLAN.md` (rationale, data sources, deployment notes) and `SOLARCHARGE_EXPERIMENT_LOG.md` (full run-by-run history).
+
+---
+
 ## Project Structure
 
 ```
@@ -573,7 +588,8 @@ python Inference_InfluxDB_Writer.py
     ├── Model 5b Conv2D/                    # Conv2D architecture experiments (best 0.0024, Exp 32)
     ├── Model 6/                            # Solar radiation prediction
     ├── Forecaster_1/                       # Weather condition classifier (F1 0.523, complete)
-    └── Forecaster_2/                       # Hierarchical redesign (in progress)
+    ├── Forecaster_2/                       # Hierarchical redesign (in progress)
+    └── SolarChargeML/                      # EV charge optimization (related project, see below)
 ```
 
 ---

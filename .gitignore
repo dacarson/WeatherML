@@ -11,6 +11,7 @@ workspace/*/checkpoints/
 workspace/*.csv
 workspace/*.csv.zip
 !workspace/fold_metrics.csv
+workspace/SolarChargeML/*.csv
 
 # Per-location data subdirectories
 workspace/export_influx_to_csv.py
