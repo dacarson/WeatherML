@@ -147,7 +147,34 @@ incorporate WeatherFlow station data, not just PVS6 history, since decided with 
    version on the Pi than trained the model, breaking unpickling
    (`ModuleNotFoundError: No module named '_loss'` — pickled sklearn models are only
    version-portable to the exact training version) — fixed by pinning `scikit-learn==1.7.0`
-   exactly in `requirements.txt` (committed 2026-08-20). Once 3+ independent windows have
-   accumulated, per `[[feedback_live_validation_window]]`, compare `model_excess_watts` vs.
-   `heuristic_excess_watts` in `solar_charge_shadow` before any change to
-   `solar_charge_controller.py` itself.
+   exactly in `requirements.txt` (committed 2026-08-20).
+5. **Watts MAE turned out to be the wrong optimization target (2026-09-06).** ~17 days of live
+   shadow data showed `model_run4` beating the heuristic 9-17% on watts MAE, but that barely
+   moved amp-decision accuracy (+3pp exact-match vs. a perfect-hindsight ideal amp) or dollars
+   (~$4.60/month, mostly in `off_peak`) — `determine_target_amperage()`'s ~240W-wide rounding
+   buckets absorb most small forecast improvements. Investigated whether a differently-trained
+   model could close more of that gap directly on amp/dollar metrics (`decision_policy.py`,
+   `evaluate_candidates.py` — new shared modules implementing the exact TOU-threshold/amp-rounding
+   logic and PG&E NEM 3.0 rate tables). Retraining on more data alone (Run 5a) barely moved the $
+   number. An asymmetric quantile-loss sweep (Run 5b/5c) found that `HistGradientBoostingRegressor
+   (loss="quantile", quantile=0.3)` — deliberately biasing predictions *below* the median —
+   **saves $6.33/month vs. the heuristic (vs. model_run4's $1.90) despite worse watts MAE**, by
+   partially correcting for `determine_target_amperage`'s round-up-always convention (which
+   forces a flat 8A/1920W grid-import floor whenever true excess is anywhere in `(-500W,
+   1800W)`, 40.6% of off-peak rows). Verified this isn't free lunch from an unmodeled cost:
+   `q=0.3`'s stop/start oscillation rate (4.36 flips/day off-peak) is *below* the heuristic's own
+   (4.46), while lower quantiles that looked even better on $ (down to +$16.55/month at `q=0.10`)
+   were rejected — they cross above the heuristic's oscillation rate and their amp-accuracy
+   degrades monotonically, confirming the naive $ metric alone doesn't fully price in the value
+   of actually using available solar. **`model_run5.joblib` (= the winning `q=0.3` run) is
+   promoted as the new best deployment candidate**, superseding `model_run4.joblib`. Full
+   analysis in `SOLARCHARGE_EXPERIMENT_LOG.md` Runs 5a-5c.
+6. **Deployed 2026-09-06/07.** `model_run5.joblib` copied into `chargepoint-sunpower-chargemanager`,
+   `model_shadow_logger.py`'s default `--model-path` now points to it (verified end-to-end
+   against live Pi InfluxDB before handoff), `MODEL_RUN5_README.md` written,
+   `MODEL_RUN4_README.md` marked superseded. Both repos committed and deployed by the user.
+   Live shadow validation of `model_run5` is now running — per
+   `[[feedback_live_validation_window]]`, wait for 3+ independent windows before drawing
+   conclusions (compare `model_excess_watts` vs. `heuristic_excess_watts` in `solar_charge_shadow`,
+   and ideally re-derive amp/dollar metrics from the live data the same way
+   `evaluate_candidates.py` does offline, once enough days have accumulated).

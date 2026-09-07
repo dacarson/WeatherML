@@ -274,3 +274,312 @@ and a fast (2-min) slope alongside them.
 `SOLARCHARGE_PLAN.md` §4/§5 and the `[[feedback_live_validation_window]]` project convention, an
 offline backtest win is not sufficient on its own — next step is live validation across 3+
 independent windows before any change to `solar_charge_controller.py` itself. Not yet started.
+
+---
+
+## Live shadow validation results (2026-08-20 → 2026-09-06, ~17 days, reported by user)
+
+`model_run4.joblib` beat the heuristic on watts-level MAE by ~9-17% depending on TOU period,
+consistent with the 5.6% offline backtest and stable across four check-ins. **But this did not
+translate 1:1 into better amp decisions**: `determine_target_amperage()` rounds up to the nearest
+allowed amp (~240W-wide buckets), so small forecast differences often land on the same integer
+amp. Measured against a perfect-hindsight "ideal amp," the model's edge shrank to roughly +3
+percentage points of exact-amp-match and ~13% relative reduction in mean amp error — real, but
+much smaller than the watts MAE number suggested. Converted to PG&E NEM 3.0 cost, the model is
+saving on the order of **$4.60/month**, concentrated almost entirely in the `off_peak` TOU period.
+
+**This is the key methodological finding driving Runs 5+: watts MAE is not the right optimization
+target.** From here on, amp-decision accuracy (vs. a perfect-hindsight ideal amp, by TOU period)
+and simulated $ impact are the metrics that matter; watts MAE is reported only for continuity
+with Runs 1-4.
+
+New shared modules added for this: `feature_engineering.py` (Runs 1-4's feature logic, factored
+out of `train_run4.py` so Run 5+ scripts share one definition instead of drifting copies —
+`train_run1-4.py` are left untouched as historical records) and `decision_policy.py` (TOU
+threshold / amp rounding / PG&E rate tables / cost simulation, implementing the brief's given
+`get_tou_excess_threshold`/`determine_target_amperage` logic exactly, plus a
+`add_tou_and_season()` helper that derives TOU period and season from each row's own
+Pacific-local timestamp rather than `solar_charge_controller.py`'s real-time-only
+`datetime.now()`-based version).
+
+---
+
+## Run 5a — Retrain through today, same architecture (planned)
+
+**Date**: 2026-09-06
+**Hypothesis**: `model_run4.joblib` was trained on data only through 2026-08-20; simply
+extending the training window through today (more data, same architecture/features/hyperparams)
+might improve amp/dollar performance even before touching the loss function or feature set —
+cheapest thing to try first, and a necessary control before attributing any Run 5b result to the
+loss-function change rather than just "more data."
+
+**Split-date change**: `export_and_join.py`'s `TRAIN_END`/`VAL_START` move from
+2026-06-30/07-01 to **2026-07-16T23:59:59Z / 2026-07-17T00:00:00Z** — chosen to keep the
+validation window roughly the same length as Run 4's (51 days: Jul17→Sep6, vs. Run 4's 50 days:
+Jul1→Aug20) for comparability, while extending training by the ~2.5 weeks of new data between
+the two cutoffs. `FETCH_START` unchanged (2025-04-29); `FETCH_END` was already
+`datetime.now(timezone.utc)` (dynamic), so it picks up today's data automatically on re-run. This
+new val window overlaps the live shadow-validation period (started 2026-08-20), which lets the
+offline $ simulation below be sanity-checked against the user's live-measured ~$4.60/month figure
+for the overlapping sub-period.
+
+**Script**: `train_run5a.py`, using the new shared `feature_engineering.py` — same features,
+same `HistGradientBoostingRegressor` hyperparameters as `train_run4.py`
+(`max_iter=300, learning_rate=0.05, max_depth=8, random_state=42, validation_fraction=0.1,
+early_stopping=True, n_iter_no_change=15`), same delta-target reconstruction. Only the
+underlying data changes.
+
+**Evaluation**: `evaluate_candidates.py` (new, shared across Run 5a/5b) computes, per candidate
+(heuristic, `model_run4` unchanged, `model_run5a`, ideal/perfect-hindsight), on the *same* new
+val set:
+1. Watts MAE (continuity with Runs 1-4).
+2. Amp-decision accuracy vs. the perfect-hindsight ideal amp — % exact match and mean |amp
+   error|, broken out by `tou_period` (peak/part_peak/off_peak).
+3. Simulated $ cost (PG&E NEM 3.0 marginal rates, seasonal) — total and by TOU period, comparing
+   each candidate's amp decisions (applied against the *real* realized excess) against the
+   heuristic's and the ideal's.
+
+Evaluating `model_run4` unchanged on the *new* val set (not its original Jul1-Aug20 one) isolates
+"did retraining help" from "did the eval window change" — both vary between Run 4's original
+report and Run 5a otherwise.
+
+**Expected outcomes**: if Run 5a's amp-accuracy/$ numbers beat `model_run4`'s (on the same new
+val set), more data alone helps and Run 5b's quantile-loss experiment starts from this as the new
+baseline rather than Run 4. If not, more data alone isn't sufficient and Run 5b's result will
+need to be judged against Run 4 directly instead.
+
+---
+
+## Run 5b — Asymmetric (quantile) loss sweep (planned)
+
+**Date**: 2026-09-06
+**Hypothesis**: under NEM 3.0, over-predicting excess (charging too much) pulls the shortfall
+from the grid at the full import rate; under-predicting (charging too little) only forgoes the
+much smaller export credit (e.g. Summer off-peak: 0.2649 import vs. 0.0531 export — importing is
+~5x more expensive than the credit forgone). These are not symmetric costs, so the
+squared-error loss every prior run has used is the wrong objective for this problem — a model
+that's unbiased in watts MAE is *not* unbiased in dollar terms, since over- and under-shoots cost
+differently. `HistGradientBoostingRegressor(loss="quantile", quantile=q)` (available since
+sklearn 1.1; the deployed pin is exactly 1.7.0) lets the model target a specific quantile of the
+conditional distribution instead of the mean — `q<0.5` biases predictions below the median (i.e.
+below the typical realized value), which is exactly the "prefer to under-predict excess" bias
+NEM 3.0's asymmetric rates call for. Since the reconstructed prediction is
+`excess_now_w + model.predict(delta)`, a quantile bias on the delta target shifts the
+reconstructed excess prediction by the same rank, so this works on the delta target unchanged.
+
+**Script**: `train_run5b.py`, forked from `train_run5a.py` (same extended dataset, same
+features/hyperparams) — only `loss`/`quantile` change. Sweeps `quantile ∈ {0.3, 0.4, 0.5}`
+(`0.5` is also a genuinely different loss from Run 4/5a's default `squared_error` — pinball loss
+at the median approximates L1/MAE-optimal, not mean-optimal — so it's an informative point in the
+sweep on its own, independent of the asymmetry). Saves all three as
+`model_run5b_q{30,40,50}.joblib`; only the winner (if any beats Run 5a on the $ metric) gets
+promoted to `model_run5b.joblib`, per the "don't promote on watts MAE alone" rule below.
+
+**Evaluation**: same `evaluate_candidates.py` harness as Run 5a, all three quantile variants
+added as candidates evaluated on the same val set alongside heuristic/ideal/Run 4/Run 5a.
+
+**Promotion rule (both runs)**: per the shadow-mode findings above, a lower watts MAE alone is
+not sufficient evidence of improvement. A candidate only gets promoted to a new
+`model_runN.joblib` — and only that specific candidate — if it beats the current best (Run 4, or
+Run 5a if that wins its own comparison) on the **simulated $ metric**, with amp-decision accuracy
+as supporting evidence. `sklearn` version used to train must remain exactly `1.7.0`
+(deployed pin in the `chargepoint-sunpower-chargemanager` repo's `requirements.txt` — a version
+mismatch breaks unpickling on the Pi, as happened once already during Run 4's live deployment).
+Any promoted model's feature list is unchanged from Run 4 (same `FEATURES` order, same joblib
+bundle shape `{"model", "features"}`), so no change is needed to
+`model_shadow_logger.py`'s `build_feature_frame()` in the other repo — only if a future run
+changes the feature set would that file need updating too.
+
+**Expected outcomes**: if a `q<0.5` variant wins on $ despite a possibly worse (or unchanged)
+watts MAE, that directly confirms the asymmetric-loss hypothesis and becomes the new deployment
+candidate. If `q=0.5` alone (symmetric, but MAE-optimal rather than MSE-optimal) already wins,
+the loss *shape* (robustness to outliers) mattered more than the asymmetry. If no quantile
+variant beats Run 5a/Run 4 on $, asymmetric loss doesn't help at this amp-bucket granularity —
+plausible given how coarse the ~240W buckets are — and the amp/dollar gap identified in shadow
+mode may need a different lever entirely (e.g. a classification-style objective directly on amp
+buckets, rather than a regression + post-hoc rounding).
+
+**Results (2026-09-06)**, all candidates evaluated on the same extended val set
+(`evaluate_candidates.py`, new shared harness — amp accuracy vs. perfect-hindsight ideal amp by
+TOU period, plus simulated $/month on decision-cadence-matched rows, 65,271-row backtest,
+2026-07-17 → 2026-09-07):
+
+| Candidate | Watts MAE | ALL exact-match % | ALL mean \|amp err\| | $/month | $ vs. heuristic |
+|---|---|---|---|---|---|
+| heuristic | 387.0 W | 66.9% | 1.13 | 50.93 | — |
+| **ideal** (perfect hindsight, same policy) | 0.0 W | 100.0% | 0.00 | 46.98 | +3.96 |
+| model_run4 (unchanged, new val window) | 362.3 W | 64.6% | 1.09 | 49.04 | +1.90 |
+| model_run5a (retrained, more data) | 356.1 W | 65.6% | 1.06 | 49.46 | +1.47 |
+| model_run5b_q30 | 383.4 W | 66.9% | 1.11 | 44.60 | **+6.33** |
+| model_run5b_q40 | 354.9 W | 68.0% | 1.05 | 48.26 | +2.67 |
+| model_run5b_q50 | 340.0 W | 68.7% | 1.00 | 52.54 | −1.61 |
+
+**Headline surprise, investigated and confirmed real, not a bug**: `model_run5b_q30` saves
+**more** per month ($6.33) than the theoretical **ideal** ($3.96) — despite having *worse* watts
+MAE than every other candidate (383.4 W) and roughly the *same* amp exact-match rate as the
+heuristic. Root cause, confirmed by direct inspection: `determine_target_amperage()` always
+rounds **up**, and for any true excess in `(-500W, 1800W)` — 40.6% of all off-peak rows in this
+backtest — the existing policy (fed even a perfect forecast) floors to a flat 8A regardless of
+how close to zero the real excess is, forcing up to 1920W of grid import by design (this
+matches the off-peak policy's documented intent: tolerate grid draw rather than stop/start on
+brief dips). `model_run5b_q30`'s systematic ~163W low bias pushes 8.8% of that 8A-floor band
+down across the off-peak TOU gate (`-500W` threshold) to a 0A "don't charge" decision instead,
+avoiding that floor-import cost. **The "ideal" baseline is not the dollar-optimal achievable
+outcome — it's only "the best the existing round-up policy can do with perfect information."** A
+deliberately biased-low forecast can structurally beat it by partially correcting for the
+policy's own round-up inefficiency, a mechanism distinct from (and compounding with) the
+originally-hypothesized NEM 3.0 rate-asymmetry effect.
+
+**Oscillation check (necessary before trusting this)**: a policy that charges less often could
+just be trading dollar savings for more stop/start cycling — exactly what the off-peak
+threshold's lax `-500W` tolerance was designed to prevent, and a cost this simulation doesn't
+model. Checked directly (0→nonzero amp transitions/day on decision-cadence rows):
+
+| Candidate | off_peak flips/day | ALL flips/day |
+|---|---|---|
+| heuristic | 4.46 | 7.11 |
+| ideal | 6.51 | 9.45 |
+| model_run4 | 3.15 | 5.42 |
+| model_run5a | 3.06 | 5.46 |
+| **model_run5b_q30** | **4.36** | **6.61** |
+| model_run5b_q40 | 3.61 | 6.07 |
+| model_run5b_q50 | 3.54 | 6.15 |
+
+`model_run5b_q30`'s oscillation rate is *below* the currently-deployed heuristic's, not above
+it — the $ win isn't bought with more cycling. (Note "ideal" has the *highest* oscillation rate
+of all: perfect knowledge chases every real transient at the threshold boundary, while every
+trained model's smoother/noisier predictions act as an implicit low-pass filter — an
+unadvertised side benefit of imperfect forecasts here.)
+
+**Other findings**:
+- Run 5a (more data alone) beat `model_run4` on watts MAE (356.1 vs 362.3W) but is essentially a
+  wash on $ (+1.47 vs +1.90/month) — more data alone did not close the amp/dollar gap.
+- `q=0.5` (median/pinball loss, still symmetric) has the *best* watts MAE of any candidate
+  (340.0W) but is the only candidate that **loses money vs. the heuristic** (−1.61/month) — the
+  clearest demonstration in this project that watts MAE and dollar impact are different
+  objectives, exactly the premise motivating this whole run.
+- `q=0.3` was the best of the three brief-specified quantiles and was not yet a local optimum
+  candidate by construction (only 3 points tested) — see Run 5c.
+
+**Sanity cross-check against live shadow data**: this offline ideal-vs-heuristic gap ($3.96/mo)
+is in the same ballpark as, but smaller than, the user's live-measured `model_run4`-vs-heuristic
+gap (~$4.60/mo over the 2026-08-20→09-06 shadow window). Expected, not concerning: different
+windows (this backtest spans Jul17-Sep6, mostly *before* live shadow deployment), and the live
+figure reflects the heuristic's actual applied amperage (with its real start/stop hysteresis)
+rather than this harness's simplified formula-only reconstruction of the heuristic's decisions
+(see `decision_policy.py`'s docstring) — a deliberate simplification for cross-candidate
+consistency, not a discrepancy to chase down further here.
+
+**Decision**: do not promote Run 5a or Run 5b as-is yet — `q=0.3`'s result motivates
+characterizing the quantile-vs-$ curve further before picking a value to deploy, since only
+three points were tested and the mechanism (rounding-policy correction) suggests there may be a
+better quantile nearby, or a point where it turns over. See Run 5c.
+
+---
+
+## Run 5c — Bracketing the quantile sweep below 0.3 (planned)
+
+**Date**: 2026-09-06
+**Hypothesis**: Run 5b tested only `{0.3, 0.4, 0.5}` (the brief's specified sweep) and found
+`q=0.3` best by a wide margin, with a well-understood mechanism (correcting for
+`determine_target_amperage`'s round-up-always convention in the off-peak 8A-floor band) that
+doesn't obviously saturate at 0.3 — there could be a better value nearby, or the $ benefit could
+turn over (start losing real charging opportunities) below some point. Sweep `{0.10, 0.15, 0.20,
+0.25}` to bracket the space between "no bias" (0.5) and "0.3" and find where $/month peaks,
+using the exact-match/mean-amp-error and oscillation-rate diagnostics from Run 5b's results as
+guardrails against a value that's cheap only by refusing to charge when it shouldn't.
+
+**Script**: `train_run5c.py`, identical to `train_run5b.py` except the quantile list.
+
+**Promotion rule**: same as Run 5b — only promote if a candidate beats the current best
+(`model_run5b_q30`, $6.33/month) on the $ metric, without materially worse amp exact-match or a
+higher off-peak oscillation rate than the currently-deployed heuristic (4.46 flips/day) — that
+guardrail is new here specifically because a low enough quantile could otherwise "win" on $ by
+refusing to charge so often it effectively abandons the off-peak minimum-floor behavior the
+heuristic's design intentionally trades a little cost for.
+
+**Results (2026-09-06)**, same val set, evaluated with the guardrails added to
+`evaluate_candidates.py` (off-peak/overall oscillation rate now computed for every candidate):
+
+| Candidate | Watts MAE | ALL exact% | ALL \|err\| | $/month | $ vs heuristic | off_pk flips/day |
+|---|---|---|---|---|---|---|
+| heuristic | 387.0 W | 66.9% | 1.13 | 50.93 | — | **4.46** |
+| model_run5b_q30 | 383.4 W | 66.9% | 1.11 | 44.60 | +6.33 | **4.36** |
+| model_run5c_q25 | 413.3 W | 65.6% | 1.19 | 42.88 | +8.05 | 4.52 |
+| model_run5c_q20 | 452.3 W | 63.0% | 1.31 | 40.65 | +10.28 | 5.15 |
+| model_run5c_q15 | 525.2 W | 60.4% | 1.51 | 37.83 | +13.10 | 5.73 |
+| model_run5c_q10 | 615.5 W | 57.7% | 1.76 | 34.38 | +16.55 | 6.63 |
+
+**The guardrail caught exactly the failure mode it was designed for.** $/month keeps improving
+monotonically all the way down to `q=0.10` (+$16.55/month, more than 4x `q30`'s already-surprising
+number) — a naive "just optimize the $ metric" search would keep pushing the quantile lower
+without limit. But watts MAE, amp exact-match, and mean amp error all degrade monotonically in
+the same direction, and **off-peak oscillation exceeds the heuristic's own 4.46 flips/day at
+every tested point except `q30` itself** (`q25` already crosses over to 4.52). This confirms the
+$ simulation doesn't fully price in the value of actually using available solar — an
+aggressive-enough bias "wins" partly by refusing to charge so often it stops mattering whether a
+forecast is good, which is not a real improvement, just an unmodeled cost showing up as a free
+lunch. **`q=0.3` is the only point across the full 0.10-0.50 sweep that both beats the heuristic
+substantially on $ and stays at or below its real-world oscillation rate** — not a coincidence
+that it's also close to the crossover point between `q25` (4.52, just above heuristic) and where
+oscillation starts climbing sharply.
+
+**Decision: stop the sweep here.** Chasing a finer optimum between 0.25-0.30 risks overfitting
+hyperparameter choice to this specific 52-day validation window's idiosyncrasies rather than
+finding a genuinely better setting — `q=0.3` already satisfies every guardrail cleanly and by a
+comfortable margin. **`model_run5b_q30` is promoted to `model_run5.joblib`** as this project's
+new best deployment candidate, superseding `model_run4.joblib`.
+
+**Final comparison, all Run 5 work** (best-of-run 5a and 5b/5c vs. Run 4 and the heuristic):
+
+| | Watts MAE | $/month vs. heuristic | off_pk flips/day (heuristic: 4.46) |
+|---|---|---|---|
+| model_run4 | 362.3 W | +1.90 | 3.15 (quieter, but leaves most of the $ opportunity on the table) |
+| model_run5a (more data alone) | 356.1 W | +1.47 | 3.06 |
+| **model_run5 = model_run5b_q30 (promoted)** | 383.4 W | **+6.33** | 4.36 |
+
+Model_run5 has a *worse* watts MAE than model_run4 or model_run5a — the headline finding of this
+entire Run 5 investigation: **once amp-bucket rounding and asymmetric NEM 3.0 rates are in the
+loop, watts MAE and dollar impact are not just imperfectly correlated, they can point in opposite
+directions.** More training data alone (Run 5a) did not close the amp/dollar gap found in shadow
+mode; an asymmetric loss tuned against the real decision policy did, substantially.
+
+**Not yet done**: `model_run5.joblib` needs the same deployment treatment `model_run4.joblib`
+got (copy into `chargepoint-sunpower-chargemanager`, update `model_shadow_logger.py`'s default
+model path or its systemd config, live-validate) before this becomes more than an offline
+result — offline $ simulation is not a substitute for live validation, per this project's own
+established convention (`[[feedback_live_validation_window]]`). Feature list/order and joblib
+bundle shape are unchanged from Run 4, so `model_shadow_logger.py`'s `build_feature_frame()`
+needs no changes — only the model file itself and which path the service loads.
+
+---
+
+## model_run5 deployment (2026-09-06/07)
+
+`model_run5.joblib` copied into `chargepoint-sunpower-chargemanager`,
+`model_shadow_logger.py`'s `--model-path` default changed to `model_run5.joblib`,
+`MODEL_RUN5_README.md` written (full methodology/results summary for that repo),
+`MODEL_RUN4_README.md` marked superseded with a pointer forward. Verified structurally
+end-to-end against the live Pi InfluxDB before handoff (loads cleanly, all 30 features present,
+correctly gated off during nighttime). User committed (`80a416c`) and deployed
+(`model_shadow_logger.service` restarted 2026-09-06 20:20:11 PDT).
+
+**Post-deploy verification — false alarm, corrected.** Reconstructed the exact feature vector
+for a logged shadow prediction (2026-09-06 19:05:59 UTC, `model_excess_watts=2815.17W`) and
+compared against both models: `model_run4.joblib` reproduced the logged value almost exactly
+(2815.17W) while `model_run5.joblib` did not (2834.37W) — appeared to show the deployed service
+was still running the old model. **Root cause: that test point was from 12:05 PDT, over 8 hours
+*before* the actual service restart (20:20:11 PDT)** — at that timestamp `model_run4` genuinely
+was what was running, so the match was expected, not a deployment failure. Confirmed via
+`git log -1` on the Pi (commit `80a416c`, the model_run5 swap), `grep` on
+`model_shadow_logger.py` (`--model-path` defaults to `model_run5.joblib`), and
+`systemctl status` (service active, restarted recently) that the deployment itself is correct.
+
+**Outstanding**: no `solar_charge_shadow` points have been written since the restart yet
+(nighttime — the daytime-only gate correctly suppresses logging, nothing to log until sunrise).
+A proper post-restart live cross-check (reconstruct a daytime tick logged *after* 2026-09-06
+20:20:11 PDT and confirm it matches `model_run5`'s predictions, not `model_run4`'s) is still
+needed once real daylight data accumulates — not yet done as of this entry. Once confirmed, the
+live-validation clock for `model_run5` (per `[[feedback_live_validation_window]]`, want 3+
+independent windows before drawing conclusions) starts from the first genuine post-restart
+daytime prediction, not from the commit/restart time itself.

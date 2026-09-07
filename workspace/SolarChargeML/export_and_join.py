@@ -28,8 +28,11 @@ BIN = "30s"
 HORIZON_MIN = 5  # matches solar_charge_controller.py's deployed --control-interval
 HORIZON_STEPS = int(pd.Timedelta(minutes=HORIZON_MIN) / pd.Timedelta(BIN))
 
-TRAIN_END = pd.Timestamp("2026-06-30T23:59:59Z")
-VAL_START = pd.Timestamp("2026-07-01T00:00:00Z")
+# Extended 2026-09-06 for Run 5 (was 2026-06-30/07-01 through Run 4) — see
+# SOLARCHARGE_EXPERIMENT_LOG.md Run 5a for why this specific date (keeps the val window
+# roughly Run 4's length, shifted to end at "today").
+TRAIN_END = pd.Timestamp("2026-07-16T23:59:59Z")
+VAL_START = pd.Timestamp("2026-07-17T00:00:00Z")
 
 
 def fetch_binned_stats(db, measurement, field_aggs, start, end, chunk_days=CHUNK_DAYS, bin_width=BIN):
